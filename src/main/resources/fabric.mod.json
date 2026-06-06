@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "zote_context_mod",
+  "version": "1.3.0",
+  "name": "Zote Context Mod",
+  "description": "Exposes bot context as JSON over HTTP",
+  "authors": ["Zote"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.zote.contextmod.ContextMod"
+    ]
+  },
+  "mixins": [
+    "zote_context_mod.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.14.0",
+    "fabric-api": "*",
+    "minecraft": "~1.20.1"
+  }
+}
