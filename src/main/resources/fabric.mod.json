@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
-  "id": "zote_context_mod",
-  "version": "1.3.0",
-  "name": "Zote Context Mod",
-  "description": "Exposes bot context as JSON over HTTP",
-  "authors": ["Zote"],
+  "id": "solsai",
+  "version": "${version}",
+  "name": "Solsai",
+  "description": "Server-side HTTP API for Nilo/Zote bot inventory, state, and world context",
+  "authors": ["PrizmoElectric"],
   "contact": {},
   "license": "MIT",
-  "environment": "*",
+  "environment": "server",
   "entrypoints": {
     "main": [
       "com.zote.contextmod.ContextMod"
     ]
   },
   "mixins": [
-    "zote_context_mod.mixins.json"
+    "solsai.mixins.json"
   ],
   "depends": {
     "fabricloader": ">=0.14.0",
