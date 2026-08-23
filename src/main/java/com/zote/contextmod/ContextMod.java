@@ -74,13 +74,14 @@ public class ContextMod implements ModInitializer {
     private static class ControlState {
         boolean forward, back, left, right, jump, sneak, attack, use;
         float yaw, pitch;
+        int heldSlot = -1; // -1 = no change requested; 0-8 = hotbar slot to select
         long ts;
 
         String toJson() {
             return String.format(Locale.US,
                 "{\"active\":true,\"forward\":%b,\"back\":%b,\"left\":%b,\"right\":%b," +
-                "\"jump\":%b,\"sneak\":%b,\"attack\":%b,\"use\":%b,\"yaw\":%.3f,\"pitch\":%.3f}",
-                forward, back, left, right, jump, sneak, attack, use, yaw, pitch);
+                "\"jump\":%b,\"sneak\":%b,\"attack\":%b,\"use\":%b,\"yaw\":%.3f,\"pitch\":%.3f,\"heldSlot\":%d}",
+                forward, back, left, right, jump, sneak, attack, use, yaw, pitch, heldSlot);
         }
     }
 
@@ -235,8 +236,9 @@ public class ContextMod implements ModInitializer {
                 sendJson(exchange, buildBotState(player));
             });
 
-            // GET /bot-control?player=NILO&forward=true&back=false&...&yaw=45.0&pitch=-10.0
+            // GET /bot-control?player=NILO&forward=true&back=false&...&yaw=45.0&pitch=-10.0&heldSlot=3
             // Receives remote-control state from prizmo-system BotSneakScreen at ~10 Hz.
+            // heldSlot (0-8) is optional — omitted/absent means "no change", not slot 0.
             // Stored with a timestamp; Nilo polls /bot-control-state to read it back.
             httpServer.createContext("/bot-control", exchange -> {
                 String q = exchange.getRequestURI().getQuery();
@@ -255,6 +257,7 @@ public class ContextMod implements ModInitializer {
                         else if (part.startsWith("use="))     cs.use     = "true".equals(part.substring(4));
                         else if (part.startsWith("yaw="))   { try { cs.yaw   = Float.parseFloat(part.substring(4)); } catch (NumberFormatException ignored) {} }
                         else if (part.startsWith("pitch=")) { try { cs.pitch = Float.parseFloat(part.substring(6)); } catch (NumberFormatException ignored) {} }
+                        else if (part.startsWith("heldSlot=")) { try { cs.heldSlot = Integer.parseInt(part.substring(9)); } catch (NumberFormatException ignored) {} }
                     }
                 }
                 cs.ts = System.currentTimeMillis();
