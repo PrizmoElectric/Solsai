@@ -3,7 +3,11 @@
   "package": "com.zote.contextmod.mixin",
   "compatibilityLevel": "JAVA_17",
   "server": [
-    "MirrorCaptureMixin"
+    "MirrorCaptureMixin",
+    "ShieldDropMixin",
+    "GoalSelectorAccessor",
+    "MobEntityAccessor",
+    "LivingEntityEnchantMixin"
   ],
   "injectors": {
     "defaultRequire": 1

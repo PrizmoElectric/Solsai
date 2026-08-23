@@ -17,6 +17,10 @@ dependencies {
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Pehkui — entity/player scale API (present in Prominence II server mods folder at runtime).
+    // modCompileOnly lets Loom remap Pehkui's Intermediary class names (class_1297 etc.) to Yarn.
+    modCompileOnly files('/home/prizmo/mc-prominence2/data/mods/Pehkui-3.8.3+1.14.4-1.21.jar')
 }
 
 java {
