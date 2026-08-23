@@ -4,7 +4,10 @@
   "compatibilityLevel": "JAVA_17",
   "server": [
     "MirrorCaptureMixin",
-    "MobEntityAccessor"
+    "MobEntityAccessor",
+    "ShieldDropMixin",
+    "GoalSelectorAccessor",
+    "LivingEntityEnchantMixin"
   ],
   "injectors": {
     "defaultRequire": 1

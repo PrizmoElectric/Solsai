@@ -3,6 +3,8 @@ package com.zote.contextmod;
 import com.sun.net.httpserver.HttpServer;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.entity.EntityType;
@@ -11,10 +13,12 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.registry.Registry;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.state.property.Property;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,8 +35,17 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public class ContextMod implements ModInitializer {
+
+    // Invisible block placed at each shield ArmorStand position to intercept the Gauntlet laser.
+    // Full collision shape for raycasts (ShapeContext.absent), empty for entity movement.
+    public static final ShieldBlock SHIELD_BLOCK = Registry.register(
+        Registries.BLOCK,
+        new Identifier("solsai", "shield_block"),
+        new ShieldBlock()
+    );
 
     // Player whose C2S packets are captured for mirror/recording
     public static final String MIRROR_PLAYER = "PrizmoElectric";
@@ -82,10 +95,28 @@ public class ContextMod implements ModInitializer {
     public void onInitialize() {
         ServerLifecycleEvents.SERVER_STARTED.register(s -> {
             server = s;
+            ShieldManifestManager.onServerStart();
+            CloneManager.onServerStart();
+            GauntletManager.onServerStart();
+            EnchantTracker.onServerStart();
+            EffectTracker.onServerStart();
+            ArrowManifestManager.onServerStart();
             startHttpServer();
         });
         ServerLifecycleEvents.SERVER_STOPPED.register(s -> {
             if (httpServer != null) httpServer.stop(0);
+        });
+        ServerTickEvents.END_SERVER_TICK.register(ShieldManifestManager::tick);
+        ServerTickEvents.END_SERVER_TICK.register(CloneManager::tick);
+        ServerTickEvents.END_SERVER_TICK.register(GauntletManager::tick);
+        ServerTickEvents.END_SERVER_TICK.register(EffectTracker::tick);
+        ServerTickEvents.END_SERVER_TICK.register(ArrowManifestManager::tick);
+        // Clean per-player state on disconnect so nothing leaks across sessions
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server2) -> {
+            var uuid = handler.player.getUuid();
+            EnchantTracker.clearPlayer(uuid);
+            EffectTracker.clearPlayer(uuid);
+            ArrowManifestManager.clearPlayer(uuid);
         });
     }
 
@@ -322,6 +353,307 @@ public class ContextMod implements ModInitializer {
                 }
                 sb.append("]");
                 sendJson(exchange, sb.toString());
+            });
+
+            // GET /manifest-shield?player=X — summon one shield; dome redistributes automatically
+            httpServer.createContext("/manifest-shield", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, ShieldManifestManager.summon(server, player));
+            });
+
+            // GET /manifest-dome?player=X&count=N — instant dome of N shields (default 6)
+            httpServer.createContext("/manifest-dome", exchange -> {
+                String player = "PrizmoElectric";
+                int count = 6;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("count=")) try {
+                        count = Math.min(20, Math.max(1, Integer.parseInt(part.substring(6))));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ShieldManifestManager.summonDome(server, player, count));
+            });
+
+            // GET /split-shield?player=X&count=N — consume player's shield, split durability into N (default 6)
+            httpServer.createContext("/split-shield", exchange -> {
+                String player = "PrizmoElectric";
+                int count = 6;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("count=")) try {
+                        count = Math.min(20, Math.max(2, Integer.parseInt(part.substring(6))));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ShieldManifestManager.splitSummon(server, player, count));
+            });
+
+            // GET /dismiss-shields?player=X — remove all shields for that player
+            httpServer.createContext("/dismiss-shields", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                ShieldManifestManager.dismissAll(server, player);
+                sendJson(exchange, "{\"ok\":true}");
+            });
+
+            // GET /shield-state?player=X — returns {"count":N,"split":bool[,"pool":K],"focus":{...}}
+            httpServer.createContext("/shield-state", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, ShieldManifestManager.getState(server, player));
+            });
+
+            // GET /shield-focus?player=X&mode=stacked|distributed&track=true|false
+            // Converges shields to one direction. mode=distributed (default) places them in a curved
+            // grid; mode=stacked stacks them all at one point. track=true continuously follows the
+            // nearest living entity; track=false (default) locks to the player's current look direction.
+            httpServer.createContext("/shield-focus", exchange -> {
+                String player = "PrizmoElectric";
+                String mode   = "distributed";
+                boolean track = false;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("mode="))   mode   = part.substring(5);
+                    else if (part.startsWith("track="))  track  = "true".equals(part.substring(6));
+                }
+                sendJson(exchange, ShieldManifestManager.focus(server, player, mode, track));
+            });
+
+            // GET /shield-unfocus?player=X — return to Fibonacci dome mode
+            httpServer.createContext("/shield-unfocus", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                ShieldManifestManager.unfocus(server, player);
+                sendJson(exchange, "{\"ok\":true}");
+            });
+
+            // GET /summon-gauntlet?player=X — spawn Iron Gauntlet as a player ally
+            httpServer.createContext("/summon-gauntlet", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, GauntletManager.summon(server, player));
+            });
+
+            // GET /dismiss-gauntlet?player=X — discard the summoned gauntlet
+            httpServer.createContext("/dismiss-gauntlet", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, GauntletManager.dismiss(server, player));
+            });
+
+            // GET /gauntlet-state?player=X — {"active":bool,"hp":float}
+            httpServer.createContext("/gauntlet-state", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, GauntletManager.getState(server, player));
+            });
+
+            // GET /enchant-toggle?player=X&id=namespace:name — toggle one passive enchant
+            // Returns {"active":bool,"id":"..."} — no server thread needed; ConcurrentHashMap is safe.
+            httpServer.createContext("/enchant-toggle", exchange -> {
+                String player = "PrizmoElectric", id = null;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("id="))     id     = part.substring(3);
+                }
+                if (id == null) { sendJson(exchange, "{\"error\":\"missing id\"}"); return; }
+                Identifier enchId = Identifier.tryParse(id);
+                if (enchId == null) { sendJson(exchange, "{\"error\":\"invalid id\"}"); return; }
+                var spe = server.getPlayerManager().getPlayer(player);
+                if (spe == null) { sendJson(exchange, "{\"error\":\"player not found\"}"); return; }
+                boolean nowActive = EnchantTracker.toggle(spe.getUuid(), enchId);
+                sendJson(exchange, "{\"active\":" + nowActive + ",\"id\":\"" + enchId + "\"}");
+            });
+
+            // GET /enchant-list?player=X — returns {"active":["id1","id2",...]}
+            httpServer.createContext("/enchant-list", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                var spe = server.getPlayerManager().getPlayer(player);
+                var active = spe != null ? EnchantTracker.getActiveSet(spe.getUuid()) : Set.of();
+                StringBuilder sb = new StringBuilder("{\"active\":[");
+                boolean first = true;
+                for (var eid : active) {
+                    if (!first) sb.append(',');
+                    sb.append('"').append(eid).append('"');
+                    first = false;
+                }
+                sb.append("]}");
+                sendJson(exchange, sb.toString());
+            });
+
+            // GET /enchant-clear?player=X — remove all passive enchantments
+            httpServer.createContext("/enchant-clear", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                var spe = server.getPlayerManager().getPlayer(player);
+                if (spe != null) EnchantTracker.clearPlayer(spe.getUuid());
+                sendJson(exchange, "{\"ok\":true}");
+            });
+
+            // GET /effect-toggle?player=X&id=namespace:name — toggle one passive status effect
+            httpServer.createContext("/effect-toggle", exchange -> {
+                String player = "PrizmoElectric", id = null;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("id="))     id     = part.substring(3);
+                }
+                if (id == null) { sendJson(exchange, "{\"error\":\"missing id\"}"); return; }
+                Identifier effId = Identifier.tryParse(id);
+                if (effId == null) { sendJson(exchange, "{\"error\":\"invalid id\"}"); return; }
+                var spe = server.getPlayerManager().getPlayer(player);
+                if (spe == null) { sendJson(exchange, "{\"error\":\"player not found\"}"); return; }
+                boolean nowActive = EffectTracker.toggle(spe.getUuid(), effId);
+                sendJson(exchange, "{\"active\":" + nowActive + ",\"id\":\"" + effId + "\"}");
+            });
+
+            // GET /effect-list?player=X — returns {"active":["id1","id2",...]}
+            httpServer.createContext("/effect-list", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                var spe = server.getPlayerManager().getPlayer(player);
+                var activeEffects = spe != null ? EffectTracker.getActiveSet(spe.getUuid()) : Set.of();
+                StringBuilder sb = new StringBuilder("{\"active\":[");
+                boolean first = true;
+                for (var eid : activeEffects) {
+                    if (!first) sb.append(',');
+                    sb.append('"').append(eid).append('"');
+                    first = false;
+                }
+                sb.append("]}");
+                sendJson(exchange, sb.toString());
+            });
+
+            // GET /effect-clear?player=X — remove all passive status effects
+            httpServer.createContext("/effect-clear", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                var spe = server.getPlayerManager().getPlayer(player);
+                if (spe != null) EffectTracker.clearPlayer(spe.getUuid());
+                sendJson(exchange, "{\"ok\":true}");
+            });
+
+            // GET /body-size?player=X&scale=Y — set player size via Pehkui BASE scale (0.05–10.0)
+            httpServer.createContext("/body-size", exchange -> {
+                String player = "PrizmoElectric";
+                float scale = 1.0f;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("scale="))  { try { scale = Float.parseFloat(part.substring(6)); } catch (NumberFormatException ignored) {} }
+                }
+                sendJson(exchange, PlayerBodyManager.setSize(server, player, scale));
+            });
+
+            // GET /body-reach?player=X&scale=Y — set reach multiplier via Pehkui REACH scale (0.1–32.0)
+            httpServer.createContext("/body-reach", exchange -> {
+                String player = "PrizmoElectric";
+                float scale = 1.0f;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("scale="))  { try { scale = Float.parseFloat(part.substring(6)); } catch (NumberFormatException ignored) {} }
+                }
+                sendJson(exchange, PlayerBodyManager.setReach(server, player, scale));
+            });
+
+            // GET /body-reset?player=X — restore Pehkui BASE and REACH to default (1.0)
+            httpServer.createContext("/body-reset", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, PlayerBodyManager.reset(server, player));
+            });
+
+            // GET /arrow-manifest?player=X — conjure one floating arrow (costs inventory arrow or exhaustion)
+            httpServer.createContext("/arrow-manifest", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, ArrowManifestManager.manifest(server, player));
+            });
+
+            // GET /arrow-shoot?player=X — launch all manifested arrows at the player's look direction
+            httpServer.createContext("/arrow-shoot", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, ArrowManifestManager.shoot(server, player));
+            });
+
+            // GET /arrow-dismiss?player=X — discard all manifested arrows without shooting
+            httpServer.createContext("/arrow-dismiss", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, ArrowManifestManager.dismiss(server, player));
+            });
+
+            // GET /arrow-state?player=X — {"count":N}
+            httpServer.createContext("/arrow-state", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, ArrowManifestManager.getState(server, player));
+            });
+
+            // GET /summon-clone?player=X — spawn one flying clone with the summoner's skin
+            httpServer.createContext("/summon-clone", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, CloneManager.summon(server, player));
+            });
+
+            // GET /dismiss-clone?player=X — remove the clone for that player
+            httpServer.createContext("/dismiss-clone", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, CloneManager.dismiss(server, player));
+            });
+
+            // GET /clone-state?player=X — {"active":bool,"target":"name"|null}
+            httpServer.createContext("/clone-state", exchange -> {
+                String player = "PrizmoElectric";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&"))
+                    if (part.startsWith("player=")) player = part.substring(7);
+                sendJson(exchange, CloneManager.getState(server, player));
             });
 
             httpServer.start();
