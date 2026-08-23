@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -46,6 +47,16 @@ public class ContextMod implements ModInitializer {
     // Remote control state pushed by prizmo-system BotSneakScreen — key=playerName
     private static final ConcurrentHashMap<String, ControlState> controlStates = new ConcurrentHashMap<>();
     private static final long CONTROL_TIMEOUT_MS = 500;
+
+    // Terminal commands queued for a bot — key=playerName, consumed by /terminal-command-state
+    private static final ConcurrentHashMap<String, TerminalCommand> terminalCommands = new ConcurrentHashMap<>();
+    private static final long TERMINAL_COMMAND_TIMEOUT_MS = 5000;
+
+    private static class TerminalCommand {
+        final String cmd;
+        final long ts;
+        TerminalCommand(String cmd, long ts) { this.cmd = cmd; this.ts = ts; }
+    }
 
     private static class ControlState {
         boolean forward, back, left, right, jump, sneak, attack, use;
@@ -238,6 +249,66 @@ public class ContextMod implements ModInitializer {
                 }
             });
 
+            // GET /terminal-command?cmd=<urlencoded>[&player=NILO]
+            // Commands starting with "/" run immediately via the server console
+            // (full permission level — covers player/world manipulation: give, tp,
+            // setblock, summon, weather, time, etc.). Anything else is queued for
+            // the named bot (default NILO), which polls /terminal-command-state and
+            // runs it through its existing chat-command parser.
+            httpServer.createContext("/terminal-command", exchange -> {
+                String q = exchange.getRequestURI().getQuery();
+                String cmd = "", player = "NILO";
+                if (q != null) {
+                    for (String part : q.split("&")) {
+                        if      (part.startsWith("cmd="))    cmd    = URLDecoder.decode(part.substring(4), StandardCharsets.UTF_8);
+                        else if (part.startsWith("player=")) player = part.substring(7);
+                    }
+                }
+                sendJson(exchange, runTerminalCommand(cmd, player));
+            });
+
+            // GET /terminal-command-state?player=NILO — Nilo polls this (~10 Hz).
+            // Returns {"command":"..."} once per queued command, then {"command":null}.
+            httpServer.createContext("/terminal-command-state", exchange -> {
+                String q = exchange.getRequestURI().getQuery();
+                String player = "NILO";
+                if (q != null) {
+                    for (String part : q.split("&")) {
+                        if (part.startsWith("player=")) player = part.substring(7);
+                    }
+                }
+                TerminalCommand tc = terminalCommands.remove(player);
+                if (tc == null || System.currentTimeMillis() - tc.ts > TERMINAL_COMMAND_TIMEOUT_MS) {
+                    sendJson(exchange, "{\"command\":null}");
+                } else {
+                    sendJson(exchange, "{\"command\":\"" + escapeJson(tc.cmd) + "\"}");
+                }
+            });
+
+            // GET /clone-spawn?player=PrizmoElectric
+            // Summons a "ghost clone" (vanilla Husk, owner-following meat-shield AI)
+            // at the player's side. Costs the player 1 heart (2 HP) of magic damage.
+            httpServer.createContext("/clone-spawn", exchange -> {
+                String player = queryParam(exchange, "player", MIRROR_PLAYER);
+                sendJson(exchange, withPlayer(player, CloneManager::spawnClone));
+            });
+
+            // GET /clone-despawn-all?player=PrizmoElectric
+            // Discards every ghost clone owned by the player (current world only).
+            httpServer.createContext("/clone-despawn-all", exchange -> {
+                String player = queryParam(exchange, "player", MIRROR_PLAYER);
+                sendJson(exchange, withPlayer(player, p ->
+                    "{\"success\":true,\"despawned\":" + CloneManager.despawnAll(p) + "}"));
+            });
+
+            // GET /clone-list?player=PrizmoElectric
+            // Returns [{"uuid":...,"x":...,"y":...,"z":...,"health":...,"maxHealth":...},...]
+            // for prizmo-system to render ghost ESP overlays.
+            httpServer.createContext("/clone-list", exchange -> {
+                String player = queryParam(exchange, "player", MIRROR_PLAYER);
+                sendJson(exchange, withPlayer(player, CloneManager::listClones, "[]"));
+            });
+
             // GET /mirror-events — drain buffered C2S events captured by MirrorCaptureMixin.
             // Returns a JSON array and clears the buffer. Nilo polls this every 50ms.
             httpServer.createContext("/mirror-events", exchange -> {
@@ -257,6 +328,62 @@ public class ContextMod implements ModInitializer {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    // Commands starting with "/" execute immediately as the server console
+    // (permission level 4) — e.g. "/give PrizmoElectric diamond 1", "/tp ...",
+    // "/setblock ...", "/weather clear", "/summon ...". Anything else is queued
+    // for the named bot's chat-command parser via /terminal-command-state.
+    private static String runTerminalCommand(String cmd, String player) {
+        if (cmd.isEmpty()) return "{\"error\":\"empty command\"}";
+        if (cmd.startsWith("/")) {
+            String vanilla = cmd.substring(1);
+            CompletableFuture<String> future = new CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    server.getCommandManager().executeWithPrefix(server.getCommandSource(), vanilla);
+                    future.complete("{\"ok\":true,\"executed\":\"" + escapeJson(vanilla) + "\"}");
+                } catch (Exception e) {
+                    future.complete("{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+                }
+            });
+            try { return future.get(3, TimeUnit.SECONDS); }
+            catch (Exception e) { return "{\"error\":\"timeout\"}"; }
+        }
+        terminalCommands.put(player, new TerminalCommand(cmd, System.currentTimeMillis()));
+        return "{\"queued\":\"" + escapeJson(player) + "\"}";
+    }
+
+    private static String escapeJson(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static String queryParam(com.sun.net.httpserver.HttpExchange exchange, String key, String def) {
+        String q = exchange.getRequestURI().getQuery();
+        if (q == null) return def;
+        for (String part : q.split("&")) {
+            if (part.startsWith(key + "=")) return part.substring(key.length() + 1);
+        }
+        return def;
+    }
+
+    /** Runs fn on the server thread with the named player's ServerPlayerEntity, blocking up to 3s. */
+    private static String withPlayer(String playerName, java.util.function.Function<ServerPlayerEntity, String> fn) {
+        return withPlayer(playerName, fn, null);
+    }
+
+    private static String withPlayer(String playerName, java.util.function.Function<ServerPlayerEntity, String> fn, String notFoundResult) {
+        ServerPlayerEntity player = server.getPlayerManager().getPlayer(playerName);
+        if (player == null) {
+            return notFoundResult != null ? notFoundResult : "{\"error\":\"player '" + playerName + "' not found\"}";
+        }
+        CompletableFuture<String> future = new CompletableFuture<>();
+        server.execute(() -> {
+            try { future.complete(fn.apply(player)); }
+            catch (Exception e) { future.complete("{\"error\":\"" + escapeJson(e.getMessage()) + "\"}"); }
+        });
+        try { return future.get(3, TimeUnit.SECONDS); }
+        catch (Exception e) { return "{\"error\":\"timeout\"}"; }
     }
 
     private static void sendJson(com.sun.net.httpserver.HttpExchange exchange, String json) throws IOException {
