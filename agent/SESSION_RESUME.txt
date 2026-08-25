@@ -1,0 +1,112 @@
+SESSION RESUME — 2026-08-24 (session 2)
+=========================================================
+Pending items: agent/CHECKLIST.txt
+Full architecture: agent/map.txt
+Detailed history: agent/CHANGELOG.txt
+Project purpose: agent/OBJECTIVE.txt
+
+── CURRENT SESSION (2026-08-24, session 2) ────────────────────────────────────
+
+  Fixed the shield focus-mode "rolling" bug (shields spinning around their own forward
+  axis while turning the camera) — ShieldManifestManager.applyShieldTransform() replaced
+  a shortest-arc rotationTo() (roll left undefined) with a world-up-anchored basis (roll
+  pinned to world-up). Full root-cause + fix detail in CHANGELOG.txt session 2 entry.
+
+  Also confirmed live which machine's ShieldManifestManager.java design is actually
+  deployed (NOX's ItemDisplayEntity/Quaternionf redesign, not Apollo's stale ArmorStand
+  version) by decompiling the deployed jar directly — see CHECKLIST.txt KNOWN GAPS for
+  the reusable technique.
+
+  mod_version bumped 1.10.2 → 1.10.3, built, deployed to
+  mc-prominence2/data/mods/solsai.jar. Server NOT restarted — needs explicit user
+  go-ahead. NOT YET LIVE-TESTED.
+
+── STANDARD BUILD COMMANDS ───────────────────────────────────────────────────
+
+  cd /home/prizmo/solsai
+  JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build          # compile + package JAR
+  JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew compileJava    # compile only (faster)
+
+  JAR output: build/libs/solsai-<mod_version>.jar (see gradle.properties)
+  Deploy (NOX-local copy only — see MACHINE CONTEXT, this is not the live server):
+    cp build/libs/solsai-<v>.jar /home/prizmo/mc-prominence2/data/mods/solsai.jar
+  Restart server: needs explicit user go-ahead EVERY time, not just once per session —
+    see feedback memory. Deploying the jar file itself is fine without asking; the
+    restart to actually load it is not.
+
+  No org.gradle.java.home pin in gradle.properties (deliberately — was a machine-specific
+  path that broke Gradle on the other machine). Set JAVA_HOME per-shell as above.
+
+── RELATED PROJECTS ──────────────────────────────────────────────────────────
+
+  solsai            /home/prizmo/solsai/              ← THIS MOD (server-side Fabric)
+  prizmo-system     /home/prizmo/prizmo-system/        client-side Fabric mod, drives most
+                                                        of this mod's endpoints from its UI
+  nilo              /home/prizmo/nilo-project/nilo/    mineflayer bot (Node.js)
+  zote              /home/prizmo/zote/                 second bot (Node.js)
+  Minecraft server  Docker, runs on Apollo (192.168.1.101), port 25565 + 8080
+
+── WHAT'S BUILT (see agent/map.txt for full detail) ──────────────────────────
+
+  HTTP API (port 8080, ~40 endpoints) + 5 server-tick-hooked manager classes:
+  - ArrowManifestManager  — floating arrow formations (just reworked, see below)
+  - ShieldManifestManager — Fibonacci dome, split/focus modes, projectile reflection
+  - CloneManager          — ghost clones (Husk meat-shields) + flying skinned clone
+  - GauntletManager        — Iron Gauntlet ally
+  - EnchantTracker / EffectTracker — passive enchant/effect injection
+  - PlayerBodyManager      — Pehkui size/reach scale
+  Plus: bot context/inventory/mirror/remote-control/terminal-bridge endpoints Nilo and
+  prizmo-system both consume.
+
+── CURRENT WORK (session 1 of this doc set) ──────────────────────────────────
+
+  This session did two things:
+  1. Fixed arrow manifestation not working on NOX at all (a prizmo-system client jar
+     version mismatch — full story in prizmo-system/agent/CHANGELOG.txt's 2026-08-24
+     entry) and, while investigating, discovered THIS repo's ArrowManifestManager.java
+     had also badly diverged between NOX and Apollo (NOX: old single-ring; Apollo:
+     multi-ring + orphan-sweep + fixed yaw math). Pulled Apollo's version down as the base.
+  2. Reworked arrow formation on top of that base per two rounds of live feedback:
+     "+"/"X" crosses, diverging tilted circles, an orbiting 6th circle, radius-weighted
+     arrow distribution, a circle-count formula (1 per 12 arrows, capped at 10), a
+     MAX_ARROWS=120 total cap (FPS guard), and a hunger mechanic (empty food → -80% shot
+     speed + 1 conjure/sec cooldown). Full constant-by-constant detail in
+     CHANGELOG.txt's entry for this session — read it before touching this file again,
+     the numbers reflect real tuning, not arbitrary defaults.
+  3. Created this whole agent/ doc set — solsai had none before now.
+
+── OBJECTIVE FOR NEXT SESSION ────────────────────────────────────────────────
+
+  0. Once the user gives the go-ahead to restart, live-test the shield focus-mode roll
+     fix (session 2) — see CHECKLIST.txt's new TO DO item for the exact test.
+  1. Deploy the current (second-iteration) ArrowManifestManager.java to Apollo (jar +
+     source, same as the first iteration was) and restart the server — NEITHER has
+     happened yet as of this entry. See CHANGELOG.txt / CHECKLIST.txt for exact status.
+  2. Live-test the new arrow formation end-to-end: circle unlock thresholds, cross spin
+     directions, diverging-circle readability, the orbiting 6th circle, the MAX_ARROWS
+     cap, and the hunger speed penalty + cooldown at 0 food.
+  3. Decide whether to re-enable shield laser-blocking via a non-registered-block
+     approach (ShieldBlock is currently disabled — see CLAUDE.md's architecture notes).
+  4. Check whether the LivingEntityEnchantMixin getHandItems() compile warning actually
+     means weapon enchantments fail at runtime (untested, build-time-only observation).
+  5. Consider committing SOME of the large amount of currently-uncommitted work here —
+     `git log` is 7 commits behind everything actually in the tree (see CHANGELOG.txt's
+     RECONSTRUCTED PRE-HISTORY section), which is exactly the condition that let NOX and
+     Apollo drift apart badly enough to break a feature this session.
+
+── MACHINE CONTEXT ───────────────────────────────────────────────────────────
+
+  This machine is NOX (192.168.1.100). The Minecraft server container now runs on Apollo
+  (192.168.1.101) — /home/prizmo/mc-prominence2 is Unison-synced between the two
+  (~/.unison/prominence2.prf), but this solsai source tree is NOT synced by anything
+  automatic. NOX and Apollo each keep independent, mostly-uncommitted git working copies,
+  reconciled only by occasional manual `git merge` + ad-hoc `scp` of jars/source files.
+
+  GOTCHA (hit this session, expensive to rediscover): a local rebuild+deploy on one
+  machine can silently overwrite the other machine's newer, still-uncommitted work with
+  no warning at all — this broke arrow manifestation before this session even started.
+  Before non-trivial changes here, it's worth checking Apollo's copy of the file first:
+
+    ssh prizmo@apollo 'cat ~/solsai/src/main/java/com/zote/contextmod/<File>.java'
+
+  GitHub: https://github.com/PrizmoElectric/Solsai.git

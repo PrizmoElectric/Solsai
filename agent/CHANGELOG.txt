@@ -1,0 +1,126 @@
+SOLSAI — CHANGELOG
+====================
+Newest first.
+
+No agent-doc session log existed for this project before 2026-08-24. The entries below the
+"RECONSTRUCTED PRE-HISTORY" marker are reconstructed from `git log` and from solsai-side changes
+that got logged as part of joint sessions in prizmo-system/agent/CHANGELOG.txt (that file has
+recorded both sides of several sessions since session 15b) — they're thinner than what a real
+session log would have, because none existed. From this point forward, log real entries here too,
+not just in prizmo-system's file, even for solsai-only sessions.
+
+────────────────────────────────────────────────────────
+2026-08-24 (session 2) — Shield focus-mode "rolling" fix, deployed
+────────────────────────────────────────────────────────
+User-reported bug: manifested shields visibly roll/spin around their own forward axis while
+turning the camera in focus mode.
+
+Root cause: ShieldManifestManager.applyShieldTransform() built shield orientation with
+Quaternionf().rotationTo(SHIELD_MODEL_FRONT, outwardDir) — a shortest-arc rotation that only
+constrains the forward axis. Roll around that axis is left mathematically undefined. Focus
+mode's track=false path recomputes focusDir from the player's live look direction every tick
+(tick()'s "set.focusDir = nearestDir != null ? nearestDir : lookVector(player)"), so as the
+look vector swept, the shortest-arc quaternion's roll term swung unpredictably — visible as
+the shield spinning on its own axis on every camera turn.
+
+Before touching the file: per the NOX/Apollo drift gotcha (see CHECKLIST.txt KNOWN GAPS),
+diffed NOX's ShieldManifestManager.java against Apollo's copy. They'd diverged completely —
+Apollo's is still the OLD ArmorStand + yaw/bodyYaw/headYaw design (no DisplayEntityInvoker
+mixin, no AffineTransformation, no rotationTo at all), while NOX's is the newer
+ItemDisplayEntity + AffineTransformation/Quaternionf redesign. Confirmed which one is actually
+LIVE by decompiling the deployed jar itself (unzip + strings on
+mc-prominence2/data/mods/solsai.jar's ShieldManifestManager.class) rather than trusting either
+machine's source tree — found org/joml/Quaternionf + rotationTo signature + DisplayEntityInvoker
+references in the deployed classes, confirming NOX's version (with the bug) is what's live, not
+Apollo's stale copy. This is now a saved memory pattern (decompile the jar when the two
+machines' sources disagree about which design is current).
+
+Fix: replaced the shortest-arc rotationTo() call with an explicit orthonormal basis
+(forward/right/up) built from outwardDir and a WORLD_UP reference — same construction pattern
+already used by positionDistributed() for the focus-mode grid layout, reused here for
+consistency. This pins roll to world-up so it no longer drifts as outwardDir sweeps. Vertical
+look (forward ≈ parallel to WORLD_UP) falls back to a fixed world-X right axis, matching the
+existing degenerate-case handling in positionDistributed().
+
+mod_version bumped 1.10.2 → 1.10.3 (gradle.properties), built clean
+(JAVA_HOME=java-21-openjdk ./gradlew build), deployed to
+mc-prominence2/data/mods/solsai.jar. NOT restarted — server restart still needs explicit
+user go-ahead per standing rule, deploying the jar itself does not. NOT YET LIVE-TESTED — the
+fix has not been confirmed in-game (visually inspect a focus-mode shield while turning the
+camera, both stacked and distributed, both track=true and track=false).
+
+────────────────────────────────────────────────────────
+2026-08-24 (session 1 of this doc set) — Agent docs created + arrow formation rework
+────────────────────────────────────────────────────────
+Two threads, both already logged in full detail in
+prizmo-system/agent/CHANGELOG.txt's 2026-08-24 (session 22) entry — summarized here from
+solsai's side, see that entry for the complete story including the exact constants and
+the live-feedback iteration history:
+
+1. Diagnosed why arrow manifestation wasn't working on NOX at all: a stale client jar
+   (prizmo-system side, not this repo) — fixed by pulling Apollo's newer build. In the
+   process, discovered this repo's ArrowManifestManager.java had also diverged hard
+   between NOX and Apollo: NOX's copy was still a single flat ring, Apollo's had already
+   moved to a multi-ring design with orphan-sweep cleanup, corrected noClip/yaw math, and
+   a tuned ARROW_SPEED. Pulled Apollo's version down as the base for everything below —
+   NOX is now ahead of both its own prior state and Apollo's on this one file.
+
+2. ArrowManifestManager.java — multi-circle formation rework, two iterations based on
+   live in-game feedback:
+   - First iteration: brought back a "+"/"X" cross formation (previously existed only as
+     an idea, not in any surviving code — user description: "an + and an X, rotated in
+     opposite directions"), diverging tilted round circles from index 3, an orbiting 6th
+     circle, circle count scaling at ARROWS_PER_CIRCLE=24. Deployed to Apollo (jar +
+     source). Live-reported as "circles too close together" — root cause: circles 0/1/2
+     all shared one flat CIRCLE_RADIUS and the exact same center point.
+   - Second iteration (current state): ARROWS_PER_CIRCLE halved to 12, MAX_CIRCLES=10 hard
+     cap, every circle now has its own radius (RADIUS_BASE + circle*RADIUS_STEP) AND its
+     own center (golden-angle position offset scaled to its own radius) — fixes the
+     overlap directly. distributeArrows() replaced flat round-robin with radius-weighted
+     allocation (largest-remainder rounding). Added MAX_ARROWS=120 hard cap on total
+     manifested arrows, a direct response to reported client FPS drops at high arrow
+     counts. Added a hunger mechanic: empty food → shot speed -80%
+     (HUNGER_SPEED_MULTIPLIER) and new conjures throttled to 1/sec
+     (HUNGER_MANIFEST_COOLDOWN_TICKS, tracked per-player in lastHungryManifestTick).
+   - Status: second iteration builds clean (JAVA_HOME=java-21-openjdk ./gradlew build) but
+     is NOX-only — not yet redeployed to Apollo, server not restarted for either
+     iteration. See CHECKLIST.txt.
+
+3. Set up this agent/ doc set (CLAUDE.md, OBJECTIVE.txt, map.txt, CHECKLIST.txt,
+   CHANGELOG.txt, SESSION_RESUME.txt) — solsai had none before, unlike prizmo-system.
+   map.txt's architecture survey is a full read of every source file as of this date;
+   treat it as accurate for that snapshot, but re-verify against current code for
+   anything load-bearing, same as any other point-in-time doc.
+
+════════════════════════════════════════════════════════
+RECONSTRUCTED PRE-HISTORY (from git log + prizmo-system's joint session log)
+════════════════════════════════════════════════════════
+No dates/session numbers below are authoritative — this is a best-effort reconstruction,
+not a real log. `git log --oneline` (newest first):
+
+  3e3704a Add heldSlot to /bot-control for live hotbar switching during possession
+  76a8f9d Don't pin org.gradle.java.home to a machine-specific path
+  bf833b3 Merge NOX and Apollo solsai work
+  f913236 WIP: shield/gauntlet/clone systems, fake-player body management (NOX-side)
+  2dca634 WIP: bot remote-control/inventory API, clone AI (Apollo-side)
+  dba9601 Rename Zote Context Mod to Solsai, add bot remote-control API
+  dcc1248 Initial commit — Solsai mod v1.3.0
+
+Cross-referenced against prizmo-system/agent/CHANGELOG.txt, the following solsai-side work
+was logged as part of joint sessions (see that file for full detail on each):
+  - session 15b: ControlState/bot-control(-state) endpoints (remote control/possession).
+  - session 16: (client-only session, no solsai changes logged).
+  - session 19: CloneManager ghost clones — spawnClone/despawnAll/listClones, tagged
+    HuskEntity, FollowOwnerGoal/DefendOwnerGoal, 1-heart cost.
+  - session 20: CloneManager.listClones() gains a per-clone "task" field
+    (fighting/returning/following).
+  - session 21: ArrowManifestManager enchant/effect propagation (Power/Strength damage at
+    manifest, Flame/Punch/Piercing at shoot) — this was the arrow system's state
+    immediately before the 2026-08-24 multi-circle rework above.
+
+Everything else currently in the codebase (ShieldManifestManager's full feature set
+including projectile reflection, GauntletManager, EnchantTracker/EffectTracker,
+PlayerBodyManager, the flying-clone half of CloneManager, ShieldBlock, all mixins except
+MirrorCaptureMixin) was built at some point but never individually logged anywhere agent
+docs could find as of 2026-08-24 — map.txt's architecture survey documents their CURRENT
+state accurately, but not when or why each was built.

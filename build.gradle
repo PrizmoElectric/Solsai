@@ -12,6 +12,17 @@ base {
 
 repositories {}
 
+// Same fix as prizmo-system's build.gradle (found while rebuilding that mod):
+// without this, fabric.mod.json's "${version}" placeholder is never
+// substituted — every solsai jar has shipped reporting its version as the
+// literal string "${version}" instead of a real number.
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"

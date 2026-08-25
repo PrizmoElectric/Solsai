@@ -13,7 +13,6 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
-import net.minecraft.registry.Registry;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -39,13 +38,19 @@ import java.util.Set;
 
 public class ContextMod implements ModInitializer {
 
-    // Invisible block placed at each shield ArmorStand position to intercept the Gauntlet laser.
-    // Full collision shape for raycasts (ShapeContext.absent), empty for entity movement.
-    public static final ShieldBlock SHIELD_BLOCK = Registry.register(
-        Registries.BLOCK,
-        new Identifier("solsai", "shield_block"),
-        new ShieldBlock()
-    );
+    // DISABLED 2026-08-23: registering this block into Registries.BLOCK made Fabric's
+    // registry-sync check kick every client that doesn't have Solsai installed
+    // ("Received a registry entry that is unknown to this client") — breaks the
+    // "purely server-sided" requirement, since Solsai has no client-side jar.
+    // ShieldManifestManager's placement calls are now no-ops (mob-push/projectile-block
+    // still work; laser-wall blocking does not). Re-enable only via a redesign that
+    // doesn't add a real registry entry (e.g. mixin the collision-shape query itself
+    // instead of placing a registered block) — see agent/CHECKLIST.txt.
+    // public static final ShieldBlock SHIELD_BLOCK = Registry.register(
+    //     Registries.BLOCK,
+    //     new Identifier("solsai", "shield_block"),
+    //     new ShieldBlock()
+    // );
 
     // Player whose C2S packets are captured for mirror/recording
     public static final String MIRROR_PLAYER = "PrizmoElectric";
@@ -55,6 +60,7 @@ public class ContextMod implements ModInitializer {
 
     // Behavior mode pushed by Nilo via /bot-mode — key=playerName, value=mode string
     private static final ConcurrentHashMap<String, String> botModes = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, String> botActions = new ConcurrentHashMap<>();
     private static final int MAX_BUFFER = 2000;
 
     // Remote control state pushed by prizmo-system BotSneakScreen — key=playerName
@@ -209,17 +215,23 @@ public class ContextMod implements ModInitializer {
                 sendJson(exchange, buildItemMove(from, fromSlot, to, toSlot, count));
             });
 
-            // GET /bot-mode?player=NILO&mode=follow — receive behavior mode push from Nilo Node.js
+            // GET /bot-mode?player=NILO&mode=follow&action=Fighting%20zombie — receive
+            // behavior mode (+ optional free-text current action) push from Nilo Node.js
             httpServer.createContext("/bot-mode", exchange -> {
                 String q = exchange.getRequestURI().getQuery();
-                String player = "NILO", mode = "idle";
+                String player = "NILO", mode = "idle", action = "";
                 if (q != null) {
                     for (String part : q.split("&")) {
                         if      (part.startsWith("player=")) player = part.substring(7);
                         else if (part.startsWith("mode="))   mode   = part.substring(5);
+                        else if (part.startsWith("action=")) {
+                            try { action = URLDecoder.decode(part.substring(7), StandardCharsets.UTF_8); }
+                            catch (Exception ignored) {}
+                        }
                     }
                 }
                 botModes.put(player, mode);
+                botActions.put(player, action);
                 sendJson(exchange, "{\"ok\":true}");
             });
 
@@ -605,6 +617,20 @@ public class ContextMod implements ModInitializer {
                 sendJson(exchange, ArrowManifestManager.manifest(server, player));
             });
 
+            // GET /arrow-manifest-burst?player=X&count=N — conjure N arrows in one call (default 12)
+            httpServer.createContext("/arrow-manifest-burst", exchange -> {
+                String player = "PrizmoElectric";
+                int count = 12;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("count=")) try {
+                        count = Math.min(50, Math.max(1, Integer.parseInt(part.substring(6))));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ArrowManifestManager.manifestBurst(server, player, count));
+            });
+
             // GET /arrow-shoot?player=X — launch all manifested arrows at the player's look direction
             httpServer.createContext("/arrow-shoot", exchange -> {
                 String player = "PrizmoElectric";
@@ -918,10 +944,12 @@ public class ContextMod implements ModInitializer {
         if (player == null) return "{\"connected\":false,\"error\":\"not found\"}";
         float health = player.getHealth();
         int   food   = player.getHungerManager().getFoodLevel();
-        String mode  = botModes.getOrDefault(playerName, "idle");
+        String mode   = botModes.getOrDefault(playerName, "idle");
+        String action = botActions.getOrDefault(playerName, "");
         return "{\"connected\":true,\"health\":" + health
              + ",\"food\":" + food
-             + ",\"behaviorMode\":\"" + mode + "\"}";
+             + ",\"behaviorMode\":\"" + mode + "\""
+             + ",\"action\":\"" + escapeJson(action) + "\"}";
     }
 
     private String buildContext() {

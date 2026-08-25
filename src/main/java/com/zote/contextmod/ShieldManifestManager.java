@@ -1,11 +1,12 @@
 package com.zote.contextmod;
 
-import net.minecraft.block.Block;
+import com.zote.contextmod.mixin.DisplayEntityInvoker;
+import com.zote.contextmod.mixin.ItemDisplayEntityInvoker;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
-import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.decoration.ArmorStandEntity;
+import net.minecraft.entity.decoration.DisplayEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.entity.projectile.PersistentProjectileEntity;
@@ -16,9 +17,13 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
+import net.minecraft.util.math.AffineTransformation;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import org.joml.Matrix3f;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -46,9 +51,9 @@ import java.util.concurrent.TimeUnit;
  *     For N=6: 3-wide × 2-tall curved wall.  For N=12: 4×3.
  *
  *   Focus direction:
- *     track=false → player's look direction at the moment focus() is called.
+ *     track=false → continuously follows the player's live look direction.
  *     track=true  → continuously tracks the nearest non-player living entity;
- *                   falls back to stored direction if none found.
+ *                   falls back to the player's live look direction while none is found.
  *
  * ── SPLIT MODE ────────────────────────────────────────────────────────────────
  *   splitSummon() consumes a vanilla shield from inventory, reads its remaining
@@ -87,9 +92,22 @@ public class ShieldManifestManager {
     private static final int    DURABILITY_PER_BLOCK  = 3;
     private static final double FOCUS_SPACING         = 0.80; // rad between shields in distributed
     private static final double FOCUS_TRACK_RADIUS    = 24.0; // blocks to scan for nearest target
+    private static final float  SHIELD_SCALE          = 1.6f; // ItemDisplayEntity model scale multiplier
+    // Facing of the shield item's FIXED-context model. Was (0,0,1) (assumed south, +Z) —
+    // confirmed backwards in-game 2026-08-23 (decorated face pointed at the player instead
+    // of away), flipped to -Z.
+    private static final Vector3f SHIELD_MODEL_FRONT  = new Vector3f(0f, 0f, -1f);
+    // Reference axis for roll-stable orientation in applyShieldTransform — keeps the
+    // shield's "up" edge anchored to world-up instead of an arbitrary shortest-arc roll.
+    private static final Vector3f WORLD_UP            = new Vector3f(0f, 1f, 0f);
 
     private static final String SHIELD_NAME  = "ShieldManifest";
     private static final double GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0)); // ≈ 2.399 rad
+
+    // Command tag marking a projectile as already-reflected, so it isn't caught and
+    // re-reflected on the next tick while it's still inside PROJ_RADIUS of the shield
+    // that bounced it (the velocity flip doesn't clear the sphere in a single tick).
+    private static final String REFLECTED_TAG = "prizmo_reflected";
 
     // ── Data model ────────────────────────────────────────────────────────────
 
@@ -115,7 +133,7 @@ public class ShieldManifestManager {
         boolean   focusActive  = false;
         boolean   trackNearest = false;
         FocusMode focusMode    = FocusMode.DISTRIBUTED;
-        Vec3d     focusDir     = null; // null until first hostile found or look-dir captured
+        Vec3d     focusDir     = null; // resolved fresh every tick in tick() while focusActive
     }
 
     private static final Map<UUID, ShieldSet> playerShields = new ConcurrentHashMap<>();
@@ -223,19 +241,92 @@ public class ShieldManifestManager {
     }
 
     /**
-     * Rotate the ArmorStand to face away from centre (outward on the sphere).
-     * Sets yaw, bodyYaw, and headYaw so the shield face points away from the player.
-     * Minecraft yaw: 0=south, 90=west, 180=north, -90=east → atan2(-dx, dz).
+     * Orient a shield ItemDisplayEntity to face outward from centre (away from the player).
+     * Display entities ignore Entity.setYaw() for their visual model — rotation is driven
+     * entirely by the AffineTransformation, so this builds a rotation quaternion mapping
+     * SHIELD_MODEL_FRONT onto the outward direction instead of setting yaw/bodyYaw/headYaw.
      */
     private static void faceOutward(Entity e, Vec3d centre) {
-        double dx = e.getX() - centre.x;
-        double dz = e.getZ() - centre.z;
-        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-        e.setYaw(yaw);
-        if (e instanceof LivingEntity le) {
-            le.setBodyYaw(yaw);
-            le.setHeadYaw(yaw);
+        if (!(e instanceof DisplayEntity)) return;
+        double dx = e.getX() - centre.x, dy = e.getY() - centre.y, dz = e.getZ() - centre.z;
+        double len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        Vector3f dir = len > 0.001
+            ? new Vector3f((float) (dx/len), (float) (dy/len), (float) (dz/len))
+            : new Vector3f(SHIELD_MODEL_FRONT);
+        applyShieldTransform((DisplayEntity) e, dir);
+    }
+
+    /**
+     * Build and apply the outward-facing, scaled transform for a shield display entity.
+     *
+     * Was Quaternionf().rotationTo(SHIELD_MODEL_FRONT, outwardDir) — a shortest-arc
+     * rotation that only pins the forward axis. Roll around that axis is left
+     * unconstrained, so as outwardDir swept smoothly (e.g. focus mode's track=false
+     * following the player's live look direction every tick), the shield visibly spun
+     * around its own forward axis on every camera turn. Confirmed live 2026-08-24.
+     *
+     * Fixed by building an explicit orthonormal basis anchored to WORLD_UP (same
+     * construction as positionDistributed's right/localUp frame) and converting that
+     * basis directly to a quaternion, so roll always stays locked to world-up instead
+     * of drifting with outwardDir.
+     */
+    private static void applyShieldTransform(DisplayEntity display, Vector3f outwardDir) {
+        Vector3f forward = outwardDir.lengthSquared() > 1e-6f
+            ? new Vector3f(outwardDir).normalize()
+            : new Vector3f(SHIELD_MODEL_FRONT);
+
+        Vector3f right = new Vector3f();
+        if (Math.abs(forward.dot(WORLD_UP)) > 0.999f) {
+            // Near-vertical forward — WORLD_UP fallback used elsewhere in this file too.
+            right.set(1f, 0f, 0f);
+        } else {
+            forward.cross(WORLD_UP, right).normalize();
         }
+        Vector3f up = new Vector3f();
+        right.cross(forward, up).normalize();
+
+        // Model's rest pose has local +X=right, +Y=up, -Z=forward (SHIELD_MODEL_FRONT),
+        // so local +Z maps to -forward in world space.
+        Matrix3f basis = new Matrix3f(right, up, new Vector3f(forward).negate());
+        Quaternionf rotation = new Quaternionf().setFromNormalized(basis);
+        AffineTransformation transform = new AffineTransformation(
+            new Vector3f(0f, 0f, 0f),
+            rotation,
+            new Vector3f(SHIELD_SCALE, SHIELD_SCALE, SHIELD_SCALE),
+            new Quaternionf()
+        );
+        ((DisplayEntityInvoker) display).invokeSetTransformation(transform);
+    }
+
+    /**
+     * Spawn one shield as an ItemDisplayEntity carrying the real ItemStack (NBT/enchants/
+     * glint intact) instead of a fresh vanilla one. No hitbox, no AI — a display entity is
+     * purely decorative, which structurally rules out the eating-through-shields bug the
+     * old ArmorStand-based version had.
+     */
+    private static DisplayEntity.ItemDisplayEntity spawnShieldDisplay(
+            ServerWorld world, ServerPlayerEntity player, ItemStack stack) {
+        DisplayEntity.ItemDisplayEntity display =
+            new DisplayEntity.ItemDisplayEntity(EntityType.ITEM_DISPLAY, world);
+        display.setPosition(player.getX(), player.getY() + ORBIT_CENTER_Y_OFFSET, player.getZ());
+        display.setNoGravity(true);
+        display.setCustomName(Text.literal(SHIELD_NAME));
+        ((ItemDisplayEntityInvoker) display).invokeSetItemStack(stack);
+        ((DisplayEntityInvoker) display).invokeSetBillboardMode(DisplayEntity.BillboardMode.FIXED);
+        applyShieldTransform(display, SHIELD_MODEL_FRONT); // reoriented for real on the next tick()
+        world.spawnEntity(display);
+        return display;
+    }
+
+    /** Player's current look direction as a unit vector (standard MC yaw/pitch formula). */
+    private static Vec3d lookVector(ServerPlayerEntity player) {
+        double yaw   = Math.toRadians(player.getYaw());
+        double pitch = Math.toRadians(player.getPitch());
+        return new Vec3d(
+            -Math.sin(yaw) * Math.cos(pitch),
+            -Math.sin(pitch),
+             Math.cos(yaw) * Math.cos(pitch)
+        );
     }
 
     /** Nearest non-player, non-ArmorStand living entity within FOCUS_TRACK_RADIUS. */
@@ -261,31 +352,18 @@ public class ShieldManifestManager {
     // ── Shield block placement ────────────────────────────────────────────────
 
     /**
-     * Place or move the invisible ShieldBlock to follow the ArmorStand.
-     * Only acts when the ArmorStand crosses a block boundary, so most ticks are no-ops.
-     * Does not overwrite non-air blocks (e.g. player-placed walls).
+     * DISABLED 2026-08-23 (see ContextMod.SHIELD_BLOCK) — no longer places a real block.
+     * Left as a no-op rather than deleted so call sites / lastBlockPos bookkeeping don't
+     * need to change; laser-wall blocking is off until this is redesigned without a
+     * registered block. Mob-push and projectile-block (ShieldManifestManager.tick) are
+     * unaffected — they key off the ArmorStand's entity position, not this block.
      */
     private static void updateShieldBlock(ServerWorld world, ShieldInstance inst,
                                           double x, double y, double z) {
-        BlockPos newPos = BlockPos.ofFloored(x, y, z);
-        if (newPos.equals(inst.lastBlockPos)) return;
-        if (inst.lastBlockPos != null
-                && world.getBlockState(inst.lastBlockPos).isOf(ContextMod.SHIELD_BLOCK)) {
-            world.removeBlock(inst.lastBlockPos, false);
-        }
-        if (world.getBlockState(newPos).isAir()) {
-            world.setBlockState(newPos, ContextMod.SHIELD_BLOCK.getDefaultState(),
-                Block.NOTIFY_LISTENERS | Block.SKIP_DROPS);
-        }
-        inst.lastBlockPos = newPos;
     }
 
-    /** Remove the shield block for one instance (on dismiss or entity removal). */
+    /** DISABLED 2026-08-23 — see updateShieldBlock. */
     private static void removeShieldBlock(ServerWorld world, ShieldInstance inst) {
-        if (inst.lastBlockPos != null
-                && world.getBlockState(inst.lastBlockPos).isOf(ContextMod.SHIELD_BLOCK)) {
-            world.removeBlock(inst.lastBlockPos, false);
-        }
         inst.lastBlockPos = null;
     }
 
@@ -293,20 +371,19 @@ public class ShieldManifestManager {
 
     /**
      * Try to consume one vanilla shield from player inventory.
-     * Returns the shield's remaining durability, or -1 if no shield was found.
+     * Returns the removed ItemStack (real NBT/enchants/glint intact), or null if none found.
      */
-    private static int consumeShieldFromInventory(ServerPlayerEntity player) {
+    private static ItemStack consumeShieldFromInventory(ServerPlayerEntity player) {
         var inv = player.getInventory();
         for (int s = 0; s < inv.size(); s++) {
             ItemStack st = inv.getStack(s);
             if (st.getItem() == Items.SHIELD) {
-                int remaining = Math.max(10, st.getMaxDamage() - st.getDamage());
-                inv.removeStack(s, 1);
+                ItemStack removed = inv.removeStack(s, 1);
                 inv.markDirty();
-                return remaining;
+                return removed;
             }
         }
-        return -1;
+        return null;
     }
 
     /**
@@ -319,20 +396,19 @@ public class ShieldManifestManager {
         ServerWorld world = player.getServerWorld();
 
         for (int n = 0; n < count; n++) {
-            int pool = consumeShieldFromInventory(player);
-            if (pool < 0) {
+            ItemStack shieldStack = consumeShieldFromInventory(player);
+            int pool;
+            if (shieldStack == null) {
                 player.addExhaustion(3.0f);
+                shieldStack = new ItemStack(Items.SHIELD);
                 pool = 100;
+            } else {
+                pool = Math.max(10, shieldStack.getMaxDamage() - shieldStack.getDamage());
             }
 
-            ArmorStandEntity stand = new ArmorStandEntity(EntityType.ARMOR_STAND, world);
-            stand.setPosition(player.getX(), player.getY() + ORBIT_CENTER_Y_OFFSET, player.getZ());
-            stand.setNoGravity(true);
-            stand.setCustomName(Text.literal(SHIELD_NAME));
-            stand.equipStack(EquipmentSlot.OFFHAND, new ItemStack(Items.SHIELD));
-            world.spawnEntity(stand);
+            DisplayEntity.ItemDisplayEntity display = spawnShieldDisplay(world, player, shieldStack);
 
-            ShieldInstance inst = new ShieldInstance(stand.getUuid());
+            ShieldInstance inst = new ShieldInstance(display.getUuid());
             inst.durabilityPool = pool;
             set.shields.add(inst);
         }
@@ -355,7 +431,7 @@ public class ShieldManifestManager {
 
     // ── Internal spawn (used by splitSummon — must run on server thread) ─────
 
-    private static String spawnShields(ServerPlayerEntity player, int count, int pool) {
+    private static String spawnShields(ServerPlayerEntity player, int count, int pool, ItemStack sourceStack) {
         UUID playerUUID   = player.getUuid();
         ShieldSet set     = playerShields.computeIfAbsent(playerUUID, k -> new ShieldSet());
         ServerWorld world = player.getServerWorld();
@@ -363,13 +439,11 @@ public class ShieldManifestManager {
         if (pool != Integer.MAX_VALUE && !set.isSplit()) set.sharedPool = pool;
 
         for (int n = 0; n < count; n++) {
-            ArmorStandEntity stand = new ArmorStandEntity(EntityType.ARMOR_STAND, world);
-            stand.setPosition(player.getX(), player.getY() + ORBIT_CENTER_Y_OFFSET, player.getZ());
-            stand.setNoGravity(true);
-            stand.setCustomName(Text.literal(SHIELD_NAME));
-            stand.equipStack(EquipmentSlot.OFFHAND, new ItemStack(Items.SHIELD));
-            world.spawnEntity(stand);
-            set.shields.add(new ShieldInstance(stand.getUuid()));
+            // Splitting one physical shield into N displays — each gets a cosmetic copy of
+            // the source stack (real NBT/enchant glint) even though only one was consumed.
+            ItemStack displayStack = sourceStack != null ? sourceStack.copy() : new ItemStack(Items.SHIELD);
+            DisplayEntity.ItemDisplayEntity display = spawnShieldDisplay(world, player, displayStack);
+            set.shields.add(new ShieldInstance(display.getUuid()));
         }
 
         String poolStr = set.isSplit()
@@ -400,17 +474,20 @@ public class ShieldManifestManager {
             }
             if (shieldStack == null) return "{\"error\":\"no shield in inventory\"}";
             int pool = Math.max(10, shieldStack.getMaxDamage() - shieldStack.getDamage());
+            ItemStack sourceCopy = shieldStack.copy();
             inv.removeStack(slot, 1);
             inv.markDirty();
-            return spawnShields(player, count, pool);
+            return spawnShields(player, count, pool, sourceCopy);
         }, playerName);
     }
 
     /**
      * Activate focus mode.
      * mode:  "stacked" | "distributed"  (default distributed)
-     * track: true = continuously track nearest living entity
-     *        false = capture player's look direction once
+     * track: true  = continuously track nearest living entity (falls back to the
+     *                 player's live look direction while none is in range)
+     *        false = continuously follow the player's live look direction
+     * focusDir itself is resolved fresh every tick in tick() — nothing to capture here.
      */
     public static String focus(MinecraftServer server, String playerName, String mode, boolean track) {
         return runOnServer(server, player -> {
@@ -421,23 +498,6 @@ public class ShieldManifestManager {
             set.focusActive  = true;
             set.trackNearest = track;
             set.focusMode    = "stacked".equalsIgnoreCase(mode) ? FocusMode.STACKED : FocusMode.DISTRIBUTED;
-
-            if (!track) {
-                // Capture the player's current look direction
-                double yaw   = Math.toRadians(player.getYaw());
-                double pitch = Math.toRadians(player.getPitch());
-                set.focusDir = new Vec3d(
-                    -Math.sin(yaw) * Math.cos(pitch),
-                    -Math.sin(pitch),
-                     Math.cos(yaw) * Math.cos(pitch)
-                );
-                // Normalise (should already be unit, but guard floating-point)
-                double l = Math.sqrt(set.focusDir.x*set.focusDir.x
-                                   + set.focusDir.y*set.focusDir.y
-                                   + set.focusDir.z*set.focusDir.z);
-                set.focusDir = new Vec3d(set.focusDir.x/l, set.focusDir.y/l, set.focusDir.z/l);
-            }
-            // If track=true, focusDir stays null until first tick finds a target
 
             String modeStr = set.focusMode.name().toLowerCase();
             return "{\"ok\":true,\"mode\":\"" + modeStr + "\",\"tracking\":" + track + "}";
@@ -477,10 +537,33 @@ public class ShieldManifestManager {
         String poolStr = set.isSplit()
             ? ",\"totalDurability\":" + durStr + ",\"pool\":" + set.sharedPool + ",\"split\":true"
             : ",\"totalDurability\":" + durStr + ",\"split\":false";
-        String focusStr = set.focusActive
-            ? ",\"focus\":{\"active\":true,\"mode\":\"" + set.focusMode.name().toLowerCase()
-                + "\",\"tracking\":" + set.trackNearest + "}"
-            : ",\"focus\":{\"active\":false}";
+        String focusStr;
+        if (set.focusActive) {
+            // Calibration readout — STACKED only. A single point should sit exactly on
+            // eye + focusDir*ORBIT_RADIUS; DISTRIBUTED fans shields away from that point
+            // by design (grid offset), so it isn't a clean target to measure against there.
+            // Poll this while standing still: after the 2026-08-23 eye-height fix it should
+            // read near 0 (small residual = network/tick interpolation lag, not a bug);
+            // spikes while actively turning the camera are expected for the same reason.
+            String calibStr = "";
+            if (set.focusMode == FocusMode.STACKED && set.focusDir != null && !set.shields.isEmpty()) {
+                Entity e = player.getServerWorld().getEntity(set.shields.get(0).standUUID);
+                if (e != null) {
+                    Vec3d eye = player.getEyePos();
+                    Vec3d ideal = new Vec3d(
+                        eye.x + set.focusDir.x * ORBIT_RADIUS,
+                        eye.y + set.focusDir.y * ORBIT_RADIUS,
+                        eye.z + set.focusDir.z * ORBIT_RADIUS
+                    );
+                    calibStr = ",\"calibrationErrorBlocks\":"
+                        + String.format(java.util.Locale.ROOT, "%.3f", e.getPos().distanceTo(ideal));
+                }
+            }
+            focusStr = ",\"focus\":{\"active\":true,\"mode\":\"" + set.focusMode.name().toLowerCase()
+                + "\",\"tracking\":" + set.trackNearest + calibStr + "}";
+        } else {
+            focusStr = ",\"focus\":{\"active\":false}";
+        }
         return "{\"count\":" + set.shields.size() + poolStr + focusStr + "}";
     }
 
@@ -514,7 +597,18 @@ public class ShieldManifestManager {
             int total = set.shields.size();
 
             if (set.focusActive) {
-                // Resolve current focus direction
+                // Positioned relative to the EYE, not the chest-height dome centre — the
+                // crosshair ray originates at the eyes, so a chest-height origin put focus
+                // mode's shields ~0.72 blocks below where the eye ray actually points
+                // (visible as a several-degree crosshair mismatch, worse the closer the
+                // shield). Confirmed and fixed 2026-08-23. Dome mode is unaffected — it
+                // keeps orbiting the chest-height `centre` above.
+                Vec3d eye = player.getEyePos();
+
+                // Resolve current focus direction — recomputed every tick so focus
+                // continuously follows either the nearest hostile or the player's
+                // live look direction, never a stale one-time snapshot.
+                Vec3d nearestDir = null;
                 if (set.trackNearest) {
                     Entity target = findNearestHostile(world, centre);
                     if (target != null) {
@@ -524,42 +618,34 @@ public class ShieldManifestManager {
                             target.getZ()
                         );
                         Vec3d raw = new Vec3d(
-                            targetCentre.x - centre.x,
-                            targetCentre.y - centre.y,
-                            targetCentre.z - centre.z
+                            targetCentre.x - eye.x,
+                            targetCentre.y - eye.y,
+                            targetCentre.z - eye.z
                         );
                         double l = Math.sqrt(raw.x*raw.x + raw.y*raw.y + raw.z*raw.z);
-                        if (l > 0.01) set.focusDir = new Vec3d(raw.x/l, raw.y/l, raw.z/l);
+                        if (l > 0.01) nearestDir = new Vec3d(raw.x/l, raw.y/l, raw.z/l);
                     }
                 }
-                // Fallback: player look direction if no target was ever found
-                if (set.focusDir == null) {
-                    double yaw   = Math.toRadians(player.getYaw());
-                    double pitch = Math.toRadians(player.getPitch());
-                    set.focusDir = new Vec3d(
-                        -Math.sin(yaw) * Math.cos(pitch),
-                        -Math.sin(pitch),
-                         Math.cos(yaw) * Math.cos(pitch)
-                    );
-                }
+                // No tracked target (or track=false) → follow the player's live look direction.
+                set.focusDir = nearestDir != null ? nearestDir : lookVector(player);
                 Vec3d fDir = set.focusDir;
 
                 if (set.focusMode == FocusMode.STACKED) {
                     // All shields to one point, all facing outward (same direction = focusDir)
-                    double sx = centre.x + fDir.x * ORBIT_RADIUS;
-                    double sy = centre.y + fDir.y * ORBIT_RADIUS;
-                    double sz = centre.z + fDir.z * ORBIT_RADIUS;
+                    double sx = eye.x + fDir.x * ORBIT_RADIUS;
+                    double sy = eye.y + fDir.y * ORBIT_RADIUS;
+                    double sz = eye.z + fDir.z * ORBIT_RADIUS;
                     for (ShieldInstance inst : set.shields) {
                         Entity e = world.getEntity(inst.standUUID);
                         if (e != null) {
                             e.setPosition(sx, sy, sz);
-                            faceOutward(e, centre);
+                            faceOutward(e, eye);
                             updateShieldBlock(world, inst, sx, sy, sz);
                         }
                     }
                 } else {
                     // Curved grid on sphere cap
-                    positionDistributed(world, set.shields, centre, fDir);
+                    positionDistributed(world, set.shields, eye, fDir);
                 }
 
             } else {
@@ -614,19 +700,35 @@ public class ShieldManifestManager {
                 if (shieldEnt == null || shieldEnt.isRemoved()) continue;
                 Vec3d pos = shieldEnt.getPos();
 
-                // Discard incoming projectiles and drain this shield's durability
+                // Reflect incoming projectiles off the shield's outward face and drain
+                // this shield's durability, instead of just discarding them.
                 Box projBox = new Box(
                     pos.x - PROJ_RADIUS, pos.y - PROJ_RADIUS, pos.z - PROJ_RADIUS,
                     pos.x + PROJ_RADIUS, pos.y + PROJ_RADIUS, pos.z + PROJ_RADIUS
                 );
                 for (ProjectileEntity proj : world.getEntitiesByClass(
-                        ProjectileEntity.class, projBox, p -> !p.isRemoved())) {
+                        ProjectileEntity.class, projBox,
+                        p -> !p.isRemoved() && !p.getCommandTags().contains(REFLECTED_TAG))) {
                     int cost = DURABILITY_PER_BLOCK;
                     if (proj instanceof PersistentProjectileEntity) {
                         cost = (int) Math.max(1, Math.ceil(
                             ((PersistentProjectileEntity) proj).getDamage()));
                     }
-                    proj.discard();
+
+                    // Mirror the incoming velocity about the shield's outward normal
+                    // (shield position relative to the dome/focus centre).
+                    Vec3d normal = shieldEnt.getPos().subtract(centre);
+                    double nLen  = normal.length();
+                    normal = nLen > 0.01 ? normal.multiply(1.0 / nLen) : new Vec3d(0.0, 1.0, 0.0);
+                    Vec3d in  = proj.getVelocity();
+                    Vec3d out = in.subtract(normal.multiply(2 * in.dotProduct(normal)));
+                    proj.setVelocity(out.x, out.y, out.z);
+                    proj.velocityModified = true;
+                    proj.getCommandTags().add(REFLECTED_TAG);
+                    if (proj instanceof PersistentProjectileEntity pe) {
+                        pe.setOwner(null); // can now hit anyone, including its original shooter
+                    }
+
                     if (set.isSplit()) {
                         set.sharedPool -= cost;
                         if (set.sharedPool <= 0) { drained = true; break; }

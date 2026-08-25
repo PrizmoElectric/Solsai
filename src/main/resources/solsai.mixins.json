@@ -7,7 +7,9 @@
     "MobEntityAccessor",
     "ShieldDropMixin",
     "GoalSelectorAccessor",
-    "LivingEntityEnchantMixin"
+    "LivingEntityEnchantMixin",
+    "DisplayEntityInvoker",
+    "ItemDisplayEntityInvoker"
   ],
   "injectors": {
     "defaultRequire": 1
