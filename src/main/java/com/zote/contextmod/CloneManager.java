@@ -241,12 +241,21 @@ public class CloneManager {
 
             ServerWorld world = player.getServerWorld();
             FakePlayerEntity clone = new FakePlayerEntity(server, world, cloneProfile);
-            clone.setPosition(player.getX(), player.getY(), player.getZ());
 
             // Connect to server (sends initial packets through fake connection → discarded)
             FakeClientConnection conn = FakeClientConnection.create();
             new ServerPlayNetworkHandler(server, conn, clone); // sets clone.networkHandler
             server.getPlayerManager().onPlayerConnect(conn, clone);
+
+            // onPlayerConnect() runs vanilla's "first spawn" placement for any brand-new
+            // (never-before-seen) GameProfile UUID, which silently overwrites whatever
+            // position was set beforehand with the level's default spawn point. Confirmed
+            // live via server logs: every clone was landing at the fixed overworld spawn
+            // coord (410.143, 29.0, 1084.357) regardless of where the summoner actually
+            // was, and tick()'s orbit repositioning never got a chance to correct it once
+            // dismiss() (even after being fixed) orphaned it from the tracking map. Setting
+            // position AFTER connect, not before, makes it the last word.
+            clone.refreshPositionAndAngles(player.getX(), player.getY(), player.getZ(), player.getYaw(), 0f);
 
             // Configure flight
             clone.setNoGravity(true);
@@ -262,7 +271,7 @@ public class CloneManager {
         return runOnServer(server, player -> {
             CloneState state = clones.remove(player.getUuid());
             if (state == null) return "{\"error\":\"no clone active\"}";
-            discard(server, state);
+            discard(player.getServerWorld(), state);
             return "{\"ok\":true}";
         }, playerName);
     }
@@ -412,11 +421,20 @@ public class CloneManager {
         return nearest;
     }
 
-    private static void discard(MinecraftServer server, CloneState state) {
-        // Use PlayerManager.remove() so the entity is properly despawned for all clients
-        ServerPlayerEntity clone = server.getPlayerManager().getPlayer(state.cloneUUID);
-        if (clone != null) {
-            server.getPlayerManager().remove(clone);
+    private static void discard(ServerWorld world, CloneState state) {
+        // Look the entity up the same way tick() does (world.getEntity — proven to find
+        // it every tick) rather than PlayerManager.getPlayer(UUID): the clone was added
+        // to the world through a hand-rolled FakeClientConnection, not a real login, so
+        // it never actually lands in PlayerManager's own UUID map — that lookup always
+        // returned null here, discard() silently no-op'd, and the clone was orphaned
+        // (state removed so tick() stops updating it, but the entity itself never left
+        // the world). Still route the actual removal through PlayerManager.remove() so
+        // it's properly despawned for all clients (tab list, entity tracking, etc.).
+        Entity clone = world.getEntity(state.cloneUUID);
+        if (clone instanceof ServerPlayerEntity sp) {
+            world.getServer().getPlayerManager().remove(sp);
+        } else if (clone != null) {
+            clone.discard();
         }
     }
 

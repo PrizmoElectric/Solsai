@@ -52,9 +52,22 @@ public class EffectTracker {
         return s != null ? Collections.unmodifiableSet(s) : Set.of();
     }
 
+    /** UI "clear all" path (ctrl+del). Only clears `active` — `applied` is deliberately left
+     *  alone so tick()'s reconcile loop still sees what's really on the player next tick and
+     *  actually calls removeStatusEffect() for each. Clearing both here (the old behavior)
+     *  meant the reconciler had nothing left to compare against and the real potion effects
+     *  just stayed on the player for their full remaining duration while the tracker itself
+     *  looked "cleared." Use disconnectPlayer() instead for the player-left-the-server case,
+     *  where there's no more tick() reconciliation coming and both maps really should be wiped. */
     public static void clearPlayer(UUID player) {
         active.remove(player);
-        applied.remove(player);  // Bug 6: also purge applied so it doesn't leak after disconnect
+    }
+
+    /** Player disconnected — no further tick() reconciliation will ever run for them, so unlike
+     *  clearPlayer() this purges both maps outright to avoid leaking entries forever. */
+    public static void disconnectPlayer(UUID player) {
+        active.remove(player);
+        applied.remove(player);
     }
 
     public static void onServerStart() {
