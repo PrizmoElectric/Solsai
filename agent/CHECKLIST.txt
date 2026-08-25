@@ -1,0 +1,110 @@
+SOLSAI — PENDING ITEMS
+========================
+Last updated: 2026-08-24 (session 1 of this doc set)
+Architecture reference: agent/map.txt
+
+────────────────────────────────────────────────────────
+FEATURES IMPLEMENTED
+────────────────────────────────────────────────────────
+
+[x] HTTP API on port 8080 — ~40 endpoints, see map.txt's ENDPOINTS table.
+[x] World/bot context — /context, /blocknames, /all-blocks, /all-items, /all-entities,
+    /bot-inventory, /item-transfer, /item-move.
+[x] Bot mode/state push+poll — /bot-mode (Nilo pushes mode + free-text action), /bot-state.
+[x] Remote control / possession — /bot-control (push, incl. heldSlot), /bot-control-state
+    (poll, <500ms freshness window).
+[x] Mirror/recording — MirrorCaptureMixin captures MIRROR_PLAYER's C2S packets, drained via
+    /mirror-events.
+[x] Terminal bridge — /terminal-command(-state): "/"-prefixed → direct console command,
+    else queued for NILO's chat-command parser.
+[x] ShieldManifestManager — Fibonacci dome, split-durability mode, focus modes
+    (stacked/distributed, tracks nearest target), PROJECTILE REFLECTION (mirrors incoming
+    projectile velocity about the shield's outward normal, drains durability by the
+    projectile's damage, re-owns it so it can hit its original shooter — REFLECTED_TAG
+    prevents re-reflecting the same tick).
+[x] CloneManager — ghost clones (real HuskEntity, FollowOwnerGoal + DefendOwnerGoal,
+    1 heart cost) AND flying skinned clone (FakePlayerEntity + FakeClientConnection),
+    despite the shared class name (see its class-doc — merged during NOX/Apollo
+    reconciliation, never split back out).
+[x] GauntletManager — Iron Gauntlet (BOMD) ally, scoreboard team + goal-selector
+    replacement double safety against attacking its summoner.
+[x] EnchantTracker + LivingEntityEnchantMixin — passive enchantments via phantom
+    ItemStack injection into getArmorItems()/getHandItems(), real equipment untouched.
+[x] EffectTracker — passive status effects, tick-refreshed (never visibly expire),
+    instant clean removal on toggle-off.
+[x] PlayerBodyManager (Pehkui) — BASE (size) + REACH scale, 3 endpoints.
+[x] ShieldManifestManager focus-mode roll fix (session 2, 2026-08-24) — applyShieldTransform()
+    now builds orientation from a world-up-anchored basis instead of a shortest-arc
+    rotationTo(), fixing shields visibly spinning around their own forward axis while turning
+    the camera in focus mode. Built as mod_version 1.10.3, deployed to
+    mc-prominence2/data/mods/solsai.jar. NOT YET LIVE-TESTED (needs server restart first —
+    see SESSION_RESUME.txt).
+
+[x] ArrowManifestManager — multi-circle formation (session 22 of prizmo-system's log /
+    session 1 of this doc set, 2026-08-24): circle count scales with arrow count (1 per
+    ARROWS_PER_CIRCLE=12, capped MAX_CIRCLES=10), "+"/"X" cross circles at 1/2 spinning
+    opposite directions, round circles 3+ diverge (own radius + golden-angle position
+    offset + 35° tilt), circle 6 orbits the aim point while spinning, distributeArrows()
+    weights arrows per circle by radius (largest-remainder rounding), MAX_ARROWS=120 hard
+    cap (FPS guard), hunger mechanic (empty food → -80% shot speed + 1 conjure/sec
+    cooldown). Also: enchant/effect propagation onto arrows (Power/Strength at manifest,
+    Flame/Punch/Piercing at shoot), ORPHAN_TAG sweep for crash/restart recovery.
+
+────────────────────────────────────────────────────────
+TO DO
+────────────────────────────────────────────────────────
+
+[ ] Shield focus-mode roll fix — live-test after next server restart: turn the camera while
+    a shield is in focus mode (stacked AND distributed, track=true AND track=false) and
+    confirm it no longer spins around its own forward axis. See CHANGELOG.txt session 2.
+
+[ ] Arrow manifestation multi-circle rework — NOT YET LIVE TESTED. Also NOT YET
+    REDEPLOYED to Apollo (the live server host) as of this doc's creation — an earlier,
+    denser iteration (ARROWS_PER_CIRCLE=24, flat radius) WAS deployed+tested and reported
+    as "circles too close together"; the current fix for that is NOX-local only. See
+    prizmo-system/agent/CHANGELOG.txt's 2026-08-24 entry for the full story. Server not
+    restarted for either iteration.
+
+[ ] Shield laser-blocking — ShieldBlock's registration is commented out in ContextMod.java
+    (breaks Fabric's client registry-sync check for clients without Solsai, since this is
+    a server-only mod with no matching client jar). Mob-push and projectile reflection
+    still work; laser-wall blocking specifically does not. Re-enable via a different
+    mechanism — e.g. mixin the collision-shape query directly instead of a registered
+    block — rather than re-enabling the Registry.register() call as-is.
+
+[ ] LivingEntityEnchantMixin compile warning — "Unable to determine descriptor for
+    @Inject target method" on the getHandItems() injection point (build still succeeds).
+    Unclear if this means weapon enchantments (Sharpness, Looting, etc.) actually fail to
+    apply at runtime, or if it's a harmless remapping-order warning — needs an in-game
+    check, not just a build-log read.
+
+[ ] Persistent enchant/effect state — EnchantTracker and EffectTracker are both pure
+    in-memory maps, cleared on every server restart. Could persist to a JSON file
+    alongside the world save.
+
+[ ] No agent-doc session log existed for this project before 2026-08-24 (this doc set)
+    — CHANGELOG.txt's history before that date is reconstructed from `git log`, not from
+    session notes, so it's much thinner than the entries going forward. If you find
+    context about earlier decisions that isn't captured here, it's worth adding — most of
+    it currently only lives in prizmo-system's CHANGELOG.txt (which has logged solsai-side
+    changes as part of joint sessions since session 15b) or in commit messages.
+
+────────────────────────────────────────────────────────
+KNOWN GAPS
+────────────────────────────────────────────────────────
+
+[ ] NOX/Apollo source drift — see CLAUDE.md's MACHINE CONTEXT section. Not a single bug,
+    a standing risk: neither machine's local `solsai` tree is guaranteed to be the more
+    current one for any given file. Diff against Apollo before assuming otherwise:
+      ssh prizmo@apollo 'cat ~/solsai/src/main/java/com/zote/contextmod/<File>.java'
+    If the two disagree on more than minor details (session 2, 2026-08-24: they disagreed on
+    ShieldManifestManager's entire orientation architecture), don't guess which one is live —
+    decompile the deployed jar itself and check for telltale symbols:
+      cd <scratch dir> && unzip <jar> com/zote/contextmod/<File>.class -d .
+      strings com/zote/contextmod/<File>.class | grep -iE "joml|armorstand|displayentity|..."
+
+[ ] Most of this codebase is uncommitted. `git log --oneline` has only 7 commits, the
+    newest of which ("Add heldSlot to /bot-control...") predates the shield-reflection,
+    arrow multi-circle, clone/gauntlet, and enchant/effect systems entirely — `git status
+    --short` currently shows most manager files as modified/untracked. Treat `git diff`/
+    `git status`, not `git log`, as the source of truth for "what's actually here."

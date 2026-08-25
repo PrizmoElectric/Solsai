@@ -21,6 +21,7 @@ import net.minecraft.util.math.AffineTransformation;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import org.joml.Matrix3f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
@@ -96,9 +97,17 @@ public class ShieldManifestManager {
     // confirmed backwards in-game 2026-08-23 (decorated face pointed at the player instead
     // of away), flipped to -Z.
     private static final Vector3f SHIELD_MODEL_FRONT  = new Vector3f(0f, 0f, -1f);
+    // Reference axis for roll-stable orientation in applyShieldTransform — keeps the
+    // shield's "up" edge anchored to world-up instead of an arbitrary shortest-arc roll.
+    private static final Vector3f WORLD_UP            = new Vector3f(0f, 1f, 0f);
 
     private static final String SHIELD_NAME  = "ShieldManifest";
     private static final double GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0)); // ≈ 2.399 rad
+
+    // Command tag marking a projectile as already-reflected, so it isn't caught and
+    // re-reflected on the next tick while it's still inside PROJ_RADIUS of the shield
+    // that bounced it (the velocity flip doesn't clear the sphere in a single tick).
+    private static final String REFLECTED_TAG = "prizmo_reflected";
 
     // ── Data model ────────────────────────────────────────────────────────────
 
@@ -247,9 +256,39 @@ public class ShieldManifestManager {
         applyShieldTransform((DisplayEntity) e, dir);
     }
 
-    /** Build and apply the outward-facing, scaled transform for a shield display entity. */
+    /**
+     * Build and apply the outward-facing, scaled transform for a shield display entity.
+     *
+     * Was Quaternionf().rotationTo(SHIELD_MODEL_FRONT, outwardDir) — a shortest-arc
+     * rotation that only pins the forward axis. Roll around that axis is left
+     * unconstrained, so as outwardDir swept smoothly (e.g. focus mode's track=false
+     * following the player's live look direction every tick), the shield visibly spun
+     * around its own forward axis on every camera turn. Confirmed live 2026-08-24.
+     *
+     * Fixed by building an explicit orthonormal basis anchored to WORLD_UP (same
+     * construction as positionDistributed's right/localUp frame) and converting that
+     * basis directly to a quaternion, so roll always stays locked to world-up instead
+     * of drifting with outwardDir.
+     */
     private static void applyShieldTransform(DisplayEntity display, Vector3f outwardDir) {
-        Quaternionf rotation = new Quaternionf().rotationTo(SHIELD_MODEL_FRONT, outwardDir);
+        Vector3f forward = outwardDir.lengthSquared() > 1e-6f
+            ? new Vector3f(outwardDir).normalize()
+            : new Vector3f(SHIELD_MODEL_FRONT);
+
+        Vector3f right = new Vector3f();
+        if (Math.abs(forward.dot(WORLD_UP)) > 0.999f) {
+            // Near-vertical forward — WORLD_UP fallback used elsewhere in this file too.
+            right.set(1f, 0f, 0f);
+        } else {
+            forward.cross(WORLD_UP, right).normalize();
+        }
+        Vector3f up = new Vector3f();
+        right.cross(forward, up).normalize();
+
+        // Model's rest pose has local +X=right, +Y=up, -Z=forward (SHIELD_MODEL_FRONT),
+        // so local +Z maps to -forward in world space.
+        Matrix3f basis = new Matrix3f(right, up, new Vector3f(forward).negate());
+        Quaternionf rotation = new Quaternionf().setFromNormalized(basis);
         AffineTransformation transform = new AffineTransformation(
             new Vector3f(0f, 0f, 0f),
             rotation,
@@ -685,19 +724,35 @@ public class ShieldManifestManager {
                 if (shieldEnt == null || shieldEnt.isRemoved()) continue;
                 Vec3d pos = shieldEnt.getPos();
 
-                // Discard incoming projectiles and drain this shield's durability
+                // Reflect incoming projectiles off the shield's outward face and drain
+                // this shield's durability, instead of just discarding them.
                 Box projBox = new Box(
                     pos.x - PROJ_RADIUS, pos.y - PROJ_RADIUS, pos.z - PROJ_RADIUS,
                     pos.x + PROJ_RADIUS, pos.y + PROJ_RADIUS, pos.z + PROJ_RADIUS
                 );
                 for (ProjectileEntity proj : world.getEntitiesByClass(
-                        ProjectileEntity.class, projBox, p -> !p.isRemoved())) {
+                        ProjectileEntity.class, projBox,
+                        p -> !p.isRemoved() && !p.getCommandTags().contains(REFLECTED_TAG))) {
                     int cost = DURABILITY_PER_BLOCK;
                     if (proj instanceof PersistentProjectileEntity) {
                         cost = (int) Math.max(1, Math.ceil(
                             ((PersistentProjectileEntity) proj).getDamage()));
                     }
-                    proj.discard();
+
+                    // Mirror the incoming velocity about the shield's outward normal
+                    // (shield position relative to the dome/focus centre).
+                    Vec3d normal = shieldEnt.getPos().subtract(centre);
+                    double nLen  = normal.length();
+                    normal = nLen > 0.01 ? normal.multiply(1.0 / nLen) : new Vec3d(0.0, 1.0, 0.0);
+                    Vec3d in  = proj.getVelocity();
+                    Vec3d out = in.subtract(normal.multiply(2 * in.dotProduct(normal)));
+                    proj.setVelocity(out.x, out.y, out.z);
+                    proj.velocityModified = true;
+                    proj.getCommandTags().add(REFLECTED_TAG);
+                    if (proj instanceof PersistentProjectileEntity pe) {
+                        pe.setOwner(null); // can now hit anyone, including its original shooter
+                    }
+
                     if (set.isSplit()) {
                         set.sharedPool -= cost;
                         if (set.sharedPool <= 0) { drained = true; break; }

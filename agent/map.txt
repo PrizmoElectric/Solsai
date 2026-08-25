@@ -1,0 +1,228 @@
+# Solsai — Architecture Map
+
+> Quick reference for AI agents. Read this before touching any file.
+> Last updated: 2026-08-24 (session 1 of this doc set — see SESSION_RESUME.txt)
+
+---
+
+## What This Is
+
+Server-side Fabric mod for Minecraft 1.20.1 (Prominence II modpack). `environment: "server"` in
+fabric.mod.json — no client jar exists or is needed. Mod id `solsai`; Java package is still
+`com.zote.contextmod` (mod was renamed from "Zote Context Mod" but the package wasn't).
+
+**Entry point:** `ContextMod` (`ModInitializer`)
+**HTTP port:** 8080, embedded `com.sun.net.httpserver.HttpServer` (JDK built-in, no framework)
+**~40 endpoints** — see ENDPOINTS below for the full table
+**5 tick hooks** registered on `ServerTickEvents.END_SERVER_TICK`: `ShieldManifestManager::tick`,
+`CloneManager::tick`, `GauntletManager::tick`, `EffectTracker::tick`, `ArrowManifestManager::tick`
+**JAR output:** `./gradlew build` → `build/libs/solsai-<mod_version>.jar` (gradle.properties)
+**Deploy (NOX-local):** `cp build/libs/solsai-<v>.jar /home/prizmo/mc-prominence2/data/mods/solsai.jar`
+**JDK:** no `org.gradle.java.home` pin — set `JAVA_HOME` to a JDK 17-21 install before building
+**Server now runs on Apollo**, not NOX — see MACHINE CONTEXT in CLAUDE.md before assuming your
+local jar/source is what's actually live.
+
+---
+
+## Related Projects (all on this machine)
+
+| Project | Path | Language | Role |
+|---|---|---|---|
+| solsai | /home/prizmo/solsai/ | Java / Fabric | **THIS MOD** — server HTTP bridge, port 8080 |
+| prizmo-system | /home/prizmo/prizmo-system/ | Java / Fabric | Client HUD + bot UI, drives most of this mod's endpoints |
+| nilo | /home/prizmo/nilo-project/nilo/ | Node.js | Mineflayer bot (NILO) |
+| zote | /home/prizmo/zote/ | Node.js | Mineflayer bot (ZOTE) |
+| Minecraft | Docker, runs on Apollo (192.168.1.101) | — | Prominence II 1.20.1 server, port 25565 + 8080 |
+
+**Data flow:**
+```
+prizmo-system (client, keybinds/UI)      Nilo/Zote (mineflayer)
+        │  GET /manifest-shield, /arrow-manifest, ...    │  GET /bot-state, /terminal-command-state
+        │  GET /bot-state (poll, 2s)                     │  POST-style GET /bot-mode (push)
+        ▼                                                 ▼
+                    Solsai :8080 (ContextMod.java)
+                 thin routing layer → manager classes
+        │                                                 │
+        ▼                                                 ▼
+  Manager static methods (dispatch() hops to server thread)
+        │
+        ▼
+  Real Minecraft server state — entities, inventories, world
+```
+
+---
+
+## Java Package: `com.zote.contextmod`
+
+```
+ContextMod.java              ModInitializer. Owns the HttpServer (port 8080), ~40 endpoint
+│                             handlers (parse query params inline, delegate to a manager,
+│                             sendJson() the result), 5 tick-hook registrations, SERVER_STARTED/
+│                             STOPPED lifecycle hooks. Also: MIRROR_PLAYER constant, mirrorBuffer,
+│                             botModes/botActions maps (from /bot-mode push), remote-control state
+│                             map (from /bot-control push).
+│
+├── ArrowManifestManager.java  Floating arrow formations. Multi-circle math (crosses at circles
+│                             1/2, diverging tilted circles from 3+, orbiting circle 6),
+│                             distributeArrows() weighted-by-radius allocation, MAX_ARROWS cap,
+│                             hunger speed/cooldown mechanic. See its own class-level doc comment
+│                             for the full formation design — it's detailed and current.
+│
+├── ShieldManifestManager.java  Fibonacci shield dome (ArmorStand-based), split-durability mode,
+│                             focus modes (stacked/distributed tracking nearest target),
+│                             projectile reflection (mirrors incoming projectile velocity about
+│                             the shield's outward normal, drains durability, re-owns the
+│                             projectile so it can hit its original shooter). Shield laser-block
+│                             placement is currently a no-op — see ShieldBlock below.
+│
+├── CloneManager.java          TWO independent features merged into one class (see its own
+│                             class-doc — happened during NOX/Apollo reconciliation, name
+│                             collision, never split back out):
+│                               • Ghost clones — real HuskEntity, tagged (not custom entity type),
+│                                 FollowOwnerGoal + DefendOwnerGoal (ai/ package), costs 1 heart.
+│                               • Flying clone — FakePlayerEntity with the summoner's skin,
+│                                 no gravity, one per player.
+│
+├── GauntletManager.java       Iron Gauntlet (BOMD boss) as player ally. Double safety against
+│                             it attacking its summoner: scoreboard team (friendlyFire=false) +
+│                             goal-selector replacement (MobEntityAccessor/GoalSelectorAccessor)
+│                             swapping BOMD's FindTargetGoal for a vanilla ActiveTargetGoal that
+│                             excludes players/ArmorStands/itself.
+│
+├── EnchantTracker.java        Per-player passive enchantment registry (UUID → Set<Identifier>).
+│                             Builds cached phantom ItemStacks (vanilla probe items chosen so
+│                             Enchantment.isAcceptableItem() routes to the right slot) that
+│                             LivingEntityEnchantMixin appends to getArmorItems()/getHandItems()
+│                             for ServerPlayerEntity only. Real equipment never touched.
+│
+├── EffectTracker.java         Per-player passive status effect registry. Real StatusEffectInstances,
+│                             6000-tick duration, re-applied when <200 ticks remain (never visibly
+│                             expires), removed within 1 tick when toggled off (tracks exactly what
+│                             it applied, never strips a real potion). BENEFICIAL category → level
+│                             II (amplifier 1), everything else → level I.
+│
+├── PlayerBodyManager.java     Pehkui 3.8.3 integration. setSize()/setReach()/reset() —
+│                             ScaleTypes.BASE (size, clamped 0.05-10.0) and ScaleTypes.REACH
+│                             (clamped 0.1-32.0). All writes via dispatch() on the server thread.
+│
+├── ShieldBlock.java           Custom Block, full-cube collision for block raycasts (stops the
+│                             Gauntlet's laser) but empty for entity movement (walk-through).
+│                             CURRENTLY UNUSED — registering it broke Fabric's client registry
+│                             sync check for clients without Solsai (server-only mod, no client
+│                             jar to match). Registration is commented out in ContextMod.java;
+│                             see CHECKLIST.txt for the re-enable plan.
+│
+├── FakePlayerEntity.java      Extends ServerPlayerEntity directly. isDisconnected()=false (never
+│                             auto-kicked), isSpectator()/isCreative()=false, writeCustomDataToNbt
+│                             is a no-op (never saved to disk). Backs CloneManager's flying clone.
+│
+├── FakeClientConnection.java  Stub ClientConnection backed by an EmbeddedChannel; every outbound
+│                             packet to "its" client is silently discarded. Makes FakePlayerEntity
+│                             safe to treat as a normal connected player everywhere else in vanilla
+│                             server code.
+│
+├── ai/
+│   ├── FollowOwnerGoal.java    Tethers a ghost clone to its summoner (owner UUID read from the
+│   │                          clone's command tags, set once at spawn by CloneManager).
+│   └── DefendOwnerGoal.java    Highest-priority target goal — clone retaliates the instant its
+│                              owner takes damage, hands off to vanilla MeleeAttackGoal.
+│
+└── mixin/
+    ├── MirrorCaptureMixin.java     @Mixin(ServerPlayNetworkHandler) — captures MIRROR_PLAYER's
+    │                              C2S packets (movement, look, interact) into mirrorBuffer,
+    │                              drained by GET /mirror-events.
+    ├── ShieldDropMixin.java        @Mixin(LivingEntity) — cancels item drop on death for any
+    │                              entity custom-named "ShieldManifest".
+    ├── LivingEntityEnchantMixin.java  @Mixin(LivingEntity) — appends EnchantTracker's phantom
+    │                              stacks to getArmorItems()/getHandItems(), ServerPlayerEntity
+    │                              only. Has a known compile-time warning on the getHandItems()
+    │                              target descriptor (build still succeeds) — see CHECKLIST.txt.
+    ├── MobEntityAccessor.java      @Accessor(MobEntity) — exposes protected goalSelector/
+    │                              targetSelector so Clone/GauntletManager can rewrite a fresh
+    │                              mob's AI (vanilla goals are added in the constructor).
+    ├── GoalSelectorAccessor.java   @Accessor(GoalSelector) — exposes the private `goals` Set.
+    ├── DisplayEntityInvoker.java   @Invoker(DisplayEntity) — setTransformation/setBillboardMode,
+    │                              otherwise only settable from NBT/network data.
+    └── ItemDisplayEntityInvoker.java  @Invoker — package-private setItemStack.
+```
+
+`solsai.mixins.json` — all 7 mixins are in the `server` array (none in `client`, consistent with
+this being a server-only mod). `compatibilityLevel: JAVA_17`.
+
+---
+
+## ENDPOINTS (port 8080)
+
+All registered in `ContextMod.onInitialize()` via `httpServer.createContext(path, ...)`. Query
+params parsed manually (`exchange.getRequestURI().getQuery().split("&")`), response always
+`sendJson(exchange, jsonString)`. Grouped by the manager/feature they belong to:
+
+**World/bot context**
+| Endpoint | Returns |
+|---|---|
+| `/context` | position, biome, nearby blocks for a player |
+| `/blocknames?sids=N,N,...` | stateId → block name lookup |
+| `/all-blocks` | full stateId → blockName registry |
+| `/all-items` | full rawId → itemName registry |
+| `/all-entities` | entity registry |
+| `/bot-inventory?player=X` | bot's inventory |
+| `/item-transfer`, `/item-move` | inventory manipulation (prizmo-system's dual-inventory UI) |
+| `/bot-mode?player=X&mode=Y&action=Z` | Nilo pushes behavior mode + free-text current action |
+| `/bot-state?player=X` | connected/health/food/behaviorMode/action for a bot |
+
+**Remote control / mirroring**
+| Endpoint | Returns |
+|---|---|
+| `/bot-control` (push), `/bot-control-state` (poll, <500ms fresh) | possession control state, incl. heldSlot |
+| `/terminal-command`, `/terminal-command-state` | console command relay / NILO chat-command queue |
+| `/mirror-events` | drains MIRROR_PLAYER's captured C2S event buffer |
+
+**Ghost clones + flying clone** (CloneManager)
+| Endpoint | Returns |
+|---|---|
+| `/clone-spawn`, `/clone-despawn-all`, `/clone-list` | ghost clones (Husk meat-shields) |
+| `/summon-clone`, `/dismiss-clone`, `/clone-state` | flying skinned clone |
+
+**Shields** (ShieldManifestManager)
+| Endpoint | Returns |
+|---|---|
+| `/manifest-shield`, `/manifest-dome?count=N`, `/split-shield?count=N`, `/dismiss-shields`, `/shield-state` | summon/dismiss/status |
+| `/shield-focus?mode=stacked\|distributed&track=bool`, `/shield-unfocus` | focus modes |
+
+**Gauntlet** (GauntletManager) — `/summon-gauntlet`, `/dismiss-gauntlet`, `/gauntlet-state`
+
+**Enchants** (EnchantTracker) — `/enchant-toggle?id=X`, `/enchant-list`, `/enchant-clear`
+
+**Effects** (EffectTracker) — `/effect-toggle?id=X`, `/effect-list`, `/effect-clear`
+
+**Body scale** (PlayerBodyManager, Pehkui) — `/body-size?scale=Y`, `/body-reach?scale=Y`, `/body-reset`
+
+**Arrows** (ArrowManifestManager)
+| Endpoint | Returns |
+|---|---|
+| `/arrow-manifest`, `/arrow-manifest-burst?count=N` | conjure one / N arrows |
+| `/arrow-shoot` | launch all manifested arrows |
+| `/arrow-dismiss` | discard without shooting |
+| `/arrow-state` | `{"count":N}` |
+
+---
+
+## Common patterns
+
+**dispatch() hop-to-server-thread:** every manager that touches entity/world state has its own
+copy of a `dispatch(server, playerName, PlayerAction)` (or no-player-arg variant in
+PlayerBodyManager) helper: `server.execute(...)` wrapped in a `CompletableFuture`, `.get(3,
+SECONDS)` back on the HTTP handler thread. This is how HTTP-thread code safely touches
+entities/world without racing the server tick.
+
+**Tagging over custom entity types:** ghost clones, manifested shields/arrows are all vanilla
+entity types (Husk, ArrowEntity, ArmorStand) identified by `Entity#getCommandTags()` /
+`getCustomName()` string matching, never a custom `EntityType`. Keeps everything simple to spawn
+and avoids datagen/registry entirely — but means name collisions are a real risk (see
+ShieldDropMixin's `"ShieldManifest"` name check, `ORPHAN_TAG`/`REFLECTED_TAG` style tags in
+ArrowManifestManager/ShieldManifestManager).
+
+**Orphan/crash recovery:** both ArrowManifestManager and ShieldManifestManager tag every entity
+they spawn and periodically sweep the world for tagged entities NOT in their in-memory tracking
+map (which doesn't survive a server restart, unlike the real spawned entities) — see
+`sweepOrphans()` in ArrowManifestManager for the pattern.

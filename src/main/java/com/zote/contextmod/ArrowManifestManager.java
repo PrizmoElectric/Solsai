@@ -24,20 +24,27 @@ import java.util.concurrent.TimeUnit;
  *
  * Formation (the "mage spell circle" look):
  *   - Center: player eye + look * FORWARD_DIST (always in front — never behind the player)
- *   - Arrows are dealt round-robin across `totalCircles` formations, one more circle unlocking
- *     every ARROWS_PER_CIRCLE arrows (see circleCountFor()) — so the shape grows richer as more
- *     arrows accumulate instead of just packing one ring denser.
- *   - Circle 0 is always a plain round ring facing the player like a target reticle.
- *   - Circle 1 (once unlocked) is a "+" cross — arrows sit on 4 spokes through the center — and
- *     circle 2 is an "X" cross, spokes rotated 45°. The two crosses spin in OPPOSITE directions
- *     from each other, layered with the round circles rather than replacing them.
- *   - Circle 3 and up (round again) DIVERGE: each one's plane is tilted away from the player's
- *     straight-ahead look by DIVERGE_TILT, fanned around the look axis at the golden angle so
- *     successive circles don't all tilt the same way — overlapping tilted rings around one shared
- *     center, like a flower/mandala, rather than flat concentric circles.
- *   - The 6th circle (index 5) is special: instead of sitting still at the aim point like the
- *     others, its whole formation orbits the aim point (ORBIT6_RADIUS/ORBIT6_SPEED) while its own
- *     arrows keep spinning around that moving local center — a small satellite circle in motion.
+ *   - Arrows are dealt across `totalCircles` formations, one more circle unlocking every
+ *     ARROWS_PER_CIRCLE arrows (see circleCountFor()), capped at MAX_CIRCLES — and MAX_ARROWS
+ *     caps the total so entity count (and client FPS) stay bounded regardless of how much a
+ *     player conjures.
+ *   - Each circle has its own radius (RADIUS_BASE + circle*RADIUS_STEP — bigger circles further
+ *     out in the unlock order) and, from circle 1 on, its own center: shifted off the aim point
+ *     fanned around the look axis at the golden angle, scaled to that circle's own radius — so
+ *     circles read as differently sized and differently positioned instead of stacking on
+ *     exactly the same point. Arrows are split across circles by distributeArrows(), weighted by
+ *     each circle's radius so density (spacing between arrows) stays roughly even everywhere
+ *     instead of just splitting the count evenly.
+ *   - Circle 0 is a plain round ring facing the player like a target reticle (no shift/tilt).
+ *   - Circle 1 is a "+" cross — arrows sit on 4 spokes through the center — and circle 2 is an
+ *     "X" cross, spokes rotated 45°. The two crosses spin in OPPOSITE directions from each
+ *     other, layered with the round circles rather than replacing them.
+ *   - Circle 3 and up (round again) additionally DIVERGE: tilted DIVERGE_TILT off straight-ahead
+ *     around the same golden-angle azimuth as their position shift — overlapping tilted rings
+ *     around one shared area, like a flower/mandala, rather than flat concentric circles.
+ *   - The circle at ORBIT_CIRCLE_INDEX (the 6th) is special: instead of sitting at a fixed offset
+ *     like the others, its whole formation orbits the aim point (ORBIT6_RADIUS/ORBIT6_SPEED)
+ *     while its own arrows keep spinning around that moving local center.
  *
  * Arrow orientation: tiny velocity (0.02) in look direction each tick causes
  *   PersistentProjectileEntity to compute the correct visual yaw/pitch from the vector.
@@ -55,10 +62,14 @@ public class ArrowManifestManager {
     private static final int    ORPHAN_SWEEP_TICKS = 200; // ~10s — cheap enough to just always run
 
     private static final double FORWARD_DIST   = 1.8;   // blocks ahead of eye
-    private static final double CIRCLE_RADIUS  = 0.55;  // formation radius shared by rings + cross spokes
-    private static final int    ARROWS_PER_CIRCLE = 24; // one more circle unlocks every this-many arrows
+    private static final double RADIUS_BASE    = 0.42;  // circle 0's formation radius
+    private static final double RADIUS_STEP    = 0.10;  // radius growth per additional circle
+    private static final double POSITION_OFFSET_FRACTION = 0.4; // per-circle center shift, relative to its own radius
+    private static final int    ARROWS_PER_CIRCLE = 12; // one more circle unlocks every this-many arrows
+    private static final int    MAX_CIRCLES       = 10; // hard cap on circle count
+    private static final int    MAX_ARROWS        = MAX_CIRCLES * ARROWS_PER_CIRCLE; // hard cap on total manifested arrows — keeps entity count (and FPS) bounded
     private static final double SPOKE_STACK_GAP   = 0.20; // extra radius per arrow stacked beyond 4 on a cross spoke
-    private static final double DIVERGE_TILT       = Math.toRadians(30); // plane tilt for diverging round circles (index 3+)
+    private static final double DIVERGE_TILT       = Math.toRadians(35); // plane tilt for diverging round circles (index 3+)
     private static final double GOLDEN_ANGLE       = Math.PI * (3.0 - Math.sqrt(5.0)); // ≈137.5°, even fan-out per circle
     private static final int    ORBIT_CIRCLE_INDEX = 5;   // 0-based — the 6th circle
     private static final double ORBIT6_RADIUS       = 0.9;   // how far its center swings from the aim point
@@ -67,6 +78,8 @@ public class ArrowManifestManager {
     private static final double ARROW_SPEED    = 52.5;  // blocks/tick when released (base 3.5 * 15, per user request)
     private static final double ARROW_DAMAGE   = 2.5;   // hit damage (× 0.5 = hearts)
     private static final double NO_ARROW_HUNGER_CHANCE = 0.05; // chance to cost 1 hunger when no physical arrow is available
+    private static final double HUNGER_SPEED_MULTIPLIER       = 0.2; // 80% speed reduction when hunger is empty
+    private static final int    HUNGER_MANIFEST_COOLDOWN_TICKS = 20; // 1s between conjures while hunger is empty
     private static final Random RANDOM = new Random();
     private static int tickCount = 0;
     private static int sweepCounter = 0;
@@ -74,26 +87,59 @@ public class ArrowManifestManager {
     // playerUUID → ordered list of floating arrow UUIDs (order defines circle assignment)
     private static final Map<UUID, List<UUID>> manifested = new ConcurrentHashMap<>();
 
+    // playerUUID → server tick of their last conjure while hunger was empty — throttles
+    // manifest()/manifestBurst() to one arrow/second under HUNGER_MANIFEST_COOLDOWN_TICKS
+    // instead of the usual instant conjure, once the player's stomach is actually empty.
+    private static final Map<UUID, Integer> lastHungryManifestTick = new ConcurrentHashMap<>();
+
     private enum Shape { ROUND, PLUS, XCROSS }
 
     // ── Public API ─────────────────────────────────────────────────────────────
 
-    /** Conjure one arrow: consume from inventory or drain exhaustion. */
+    /** Conjure one arrow: consume from inventory or drain exhaustion. No-op once MAX_ARROWS
+     *  is already manifested — see the class doc for why the total is capped. Also no-op if
+     *  the player's hunger is empty and they're still within HUNGER_MANIFEST_COOLDOWN_TICKS of
+     *  their last conjure — see checkHungryCooldown(). */
     public static String manifest(MinecraftServer server, String playerName) {
         return dispatch(server, playerName, player -> {
             List<UUID> list = manifested.computeIfAbsent(player.getUuid(), k -> new ArrayList<>());
+            if (list.size() >= MAX_ARROWS) {
+                return "{\"ok\":true,\"count\":" + list.size() + ",\"maxed\":true}";
+            }
+            if (!checkHungryCooldown(player)) {
+                return "{\"ok\":true,\"count\":" + list.size() + ",\"cooldown\":true}";
+            }
             String src = conjureOne(player, list);
             return "{\"ok\":true,\"count\":" + list.size() + ",\"from\":\"" + src + "\"}";
         });
     }
 
-    /** Conjure several arrows in one call — same per-arrow cost/damage rules as manifest(). */
+    /** Conjure several arrows in one call — same per-arrow cost/damage rules as manifest(),
+     *  same MAX_ARROWS cap and hunger cooldown (both stop the loop early rather than erroring —
+     *  a burst call while hunger is empty effectively yields just one arrow, same as manifest()
+     *  would, one per second). */
     public static String manifestBurst(MinecraftServer server, String playerName, int count) {
         return dispatch(server, playerName, player -> {
             List<UUID> list = manifested.computeIfAbsent(player.getUuid(), k -> new ArrayList<>());
-            for (int i = 0; i < count; i++) conjureOne(player, list);
-            return "{\"ok\":true,\"count\":" + list.size() + ",\"conjured\":" + count + "}";
+            int conjured = 0;
+            while (conjured < count && list.size() < MAX_ARROWS && checkHungryCooldown(player)) {
+                conjureOne(player, list);
+                conjured++;
+            }
+            return "{\"ok\":true,\"count\":" + list.size() + ",\"conjured\":" + conjured + "}";
         });
+    }
+
+    /** Returns false (and refuses to conjure) if the player's hunger is empty and less than
+     *  HUNGER_MANIFEST_COOLDOWN_TICKS have passed since their last conjure made while hungry;
+     *  otherwise true, recording this tick as the new "last hungry conjure" when hunger is
+     *  empty. Players with any food are never throttled. */
+    private static boolean checkHungryCooldown(ServerPlayerEntity player) {
+        if (player.getHungerManager().getFoodLevel() > 0) return true;
+        Integer last = lastHungryManifestTick.get(player.getUuid());
+        if (last != null && tickCount - last < HUNGER_MANIFEST_COOLDOWN_TICKS) return false;
+        lastHungryManifestTick.put(player.getUuid(), tickCount);
+        return true;
     }
 
     /** Conjures one arrow into `list` and returns its cost source ("inventory" or "hunger"). */
@@ -173,6 +219,11 @@ public class ArrowManifestManager {
             ServerWorld world = player.getServerWorld();
             Vec3d look = player.getRotationVector();
 
+            // Hunger's already empty at shoot time (not just at manifest time) costs 80% of
+            // the volley's speed — a starving player's arrows still launch, just weakly.
+            double speed = player.getHungerManager().getFoodLevel() > 0
+                ? ARROW_SPEED : ARROW_SPEED * HUNGER_SPEED_MULTIPLIER;
+
             // Read active enchants once for all arrows in this volley
             Set<Identifier> enchants = EnchantTracker.getActiveSet(player.getUuid());
             boolean flame = enchants.contains(new Identifier("minecraft", "flame"));
@@ -197,7 +248,7 @@ public class ArrowManifestManager {
                     // Infinity-bow style — same PickupPermission vanilla uses for Infinity-enchanted
                     // shots, so these can't be collected back into inventory after landing.
                     arrow.pickupType = PersistentProjectileEntity.PickupPermission.CREATIVE_ONLY;
-                    arrow.setVelocity(look.x * ARROW_SPEED, look.y * ARROW_SPEED, look.z * ARROW_SPEED);
+                    arrow.setVelocity(look.x * speed, look.y * speed, look.z * speed);
                     if (flame)        arrow.setOnFireFor(100);
                     if (knockback > 0) arrow.setPunch(knockback);
                     if (piercing  > 0) arrow.setPierceLevel((byte) piercing);
@@ -228,9 +279,14 @@ public class ArrowManifestManager {
         return "{\"count\":" + (list == null ? 0 : list.size()) + "}";
     }
 
-    public static void clearPlayer(UUID uuid) { manifested.remove(uuid); }
+    public static void clearPlayer(UUID uuid) { manifested.remove(uuid); lastHungryManifestTick.remove(uuid); }
 
-    public static void onServerStart() { manifested.clear(); tickCount = 0; sweepCounter = 0; }
+    public static void onServerStart() {
+        manifested.clear();
+        lastHungryManifestTick.clear();
+        tickCount = 0;
+        sweepCounter = 0;
+    }
 
     // ── Tick — reposition each arrow in its formation slot ─────────────────────
 
@@ -276,19 +332,19 @@ public class ArrowManifestManager {
             int n = list.size();
             int totalCircles = circleCountFor(n);
 
+            double[] radii = new double[totalCircles];
+            for (int c = 0; c < totalCircles; c++) radii[c] = circleRadius(c);
+            int[] counts = distributeArrows(n, radii);
+            int[] boundary = new int[totalCircles + 1];
+            for (int c = 0; c < totalCircles; c++) boundary[c + 1] = boundary[c] + counts[c];
+
             for (int i = 0; i < n; i++) {
                 if (!(world.getEntity(list.get(i)) instanceof ArrowEntity arrow)) continue;
 
-                // Round-robin circle assignment so each circle stays evenly populated
-                // regardless of exactly how n divides.
-                int circle, idxInCircle, circleSize;
-                if (n == 1) {
-                    circle = 0; idxInCircle = 0; circleSize = 1;
-                } else {
-                    circle      = i % totalCircles;
-                    idxInCircle = i / totalCircles;
-                    circleSize  = n / totalCircles + (circle < n % totalCircles ? 1 : 0);
-                }
+                int circle = 0;
+                while (circle < totalCircles - 1 && i >= boundary[circle + 1]) circle++;
+                int idxInCircle = i - boundary[circle];
+                int circleSize  = counts[circle];
 
                 Vec3d pos = positionInFormation(circle, idxInCircle, circleSize, center, look, right, ringUp, t);
                 arrow.setPosition(pos.x, pos.y, pos.z);
@@ -323,10 +379,46 @@ public class ArrowManifestManager {
 
     // ── Formation math ──────────────────────────────────────────────────────────
 
-    /** One more circle unlocks every ARROWS_PER_CIRCLE arrows — 1-24 arrows is a single
-     *  circle, 25-48 adds a second, and so on, uncapped. */
+    /** One more circle unlocks every ARROWS_PER_CIRCLE arrows — 1-12 arrows is a single
+     *  circle, 13-24 adds a second, and so on, up to MAX_CIRCLES. */
     private static int circleCountFor(int arrowCount) {
-        return Math.max(1, (int) Math.ceil(arrowCount / (double) ARROWS_PER_CIRCLE));
+        return Math.min(MAX_CIRCLES, Math.max(1, (int) Math.ceil(arrowCount / (double) ARROWS_PER_CIRCLE)));
+    }
+
+    /** Each circle's own formation radius — grows with index so later circles read as
+     *  distinctly bigger, not just further off to the side. */
+    private static double circleRadius(int circle) {
+        return RADIUS_BASE + circle * RADIUS_STEP;
+    }
+
+    /** Splits n arrows across the given circles, weighted by each circle's radius (bigger
+     *  circles have more circumference to fill, so they get proportionally more arrows) —
+     *  keeps arrow density roughly even across differently-sized circles instead of just
+     *  dividing the count evenly. Uses the largest-remainder method so the counts always sum
+     *  to exactly n despite the flooring. */
+    private static int[] distributeArrows(int n, double[] radii) {
+        int c = radii.length;
+        int[] counts = new int[c];
+        if (c == 1) { counts[0] = n; return counts; }
+
+        double totalWeight = 0;
+        for (double r : radii) totalWeight += r;
+
+        double[] exact = new double[c];
+        int assigned = 0;
+        for (int i = 0; i < c; i++) {
+            exact[i] = n * radii[i] / totalWeight;
+            counts[i] = (int) exact[i];
+            assigned += counts[i];
+        }
+
+        int remaining = n - assigned;
+        Integer[] order = new Integer[c];
+        for (int i = 0; i < c; i++) order[i] = i;
+        Arrays.sort(order, (a, b) -> Double.compare(exact[b] - counts[b], exact[a] - counts[a]));
+        for (int k = 0; k < remaining; k++) counts[order[k]]++;
+
+        return counts;
     }
 
     /** Circle 0 is always round. Circles 1 and 2 (once unlocked) are the "+" and "X" crosses,
@@ -343,10 +435,11 @@ public class ArrowManifestManager {
         Shape shape = shapeOf(circle);
 
         // Spin direction: the "+" and "X" crosses always spin opposite each other regardless of
-        // index; round circles alternate by index so neighbouring rings read as layered rather
+        // index; round circles alternate by index so neighbouring circles read as layered rather
         // than moving in lockstep.
         double dir = shape == Shape.PLUS ? 1.0 : shape == Shape.XCROSS ? -1.0 : (circle % 2 == 0 ? 1.0 : -1.0);
 
+        double baseRadius = circleRadius(circle);
         double angle, radius;
         if (shape != Shape.ROUND) {
             // 4 spokes through the center (X is the same spokes rotated 45°). Beyond 4 arrows
@@ -356,29 +449,35 @@ public class ArrowManifestManager {
             int spoke = idxInCircle % 4;
             int stack = idxInCircle / 4;
             angle  = baseOffset + spoke * (Math.PI / 2.0) + t * dir;
-            radius = CIRCLE_RADIUS + stack * SPOKE_STACK_GAP;
+            radius = baseRadius + stack * SPOKE_STACK_GAP;
         } else {
             angle  = (circleSize <= 1 ? 0.0 : 2 * Math.PI * idxInCircle / circleSize) + t * dir;
-            radius = CIRCLE_RADIUS;
+            radius = baseRadius;
         }
 
-        Vec3d planeRight = right, planeUp = ringUp, formationCenter = center;
+        // Every circle beyond the first shifts its own center away from the aim point — fanned
+        // around the look axis at the golden angle per circle, magnitude scaled to that circle's
+        // own radius — so circles land at genuinely different positions (not just different
+        // shapes stacked on the same point, which read as "too close together").
+        double azimuth = circle * GOLDEN_ANGLE;
+        Vec3d azDir = right.multiply(Math.cos(azimuth)).add(ringUp.multiply(Math.sin(azimuth)));
+        Vec3d formationCenter = circle == 0 ? center : center.add(azDir.multiply(baseRadius * POSITION_OFFSET_FRACTION));
 
-        // Diverging round circles (index 3+, skipping the orbiting 6th): tilt this circle's
-        // plane away from straight-ahead by DIVERGE_TILT, fanned around the look axis at the
-        // golden angle per extra circle so they spread out evenly instead of stacking the same
-        // way — overlapping tilted rings around one shared center, like the reference image.
+        Vec3d planeRight = right, planeUp = ringUp;
+
+        // Diverging round circles (index 3+, skipping the orbiting one): additionally tilt this
+        // circle's plane, using the same azimuth as its position shift so both effects fan out
+        // together — overlapping tilted circles around one shared area, like the reference
+        // image, rather than flat concentric rings.
         if (shape == Shape.ROUND && circle >= 3 && circle != ORBIT_CIRCLE_INDEX) {
-            double azimuth = (circle - 3) * GOLDEN_ANGLE;
-            Vec3d tiltAxis = right.multiply(Math.cos(azimuth)).add(ringUp.multiply(Math.sin(azimuth))).normalize();
+            Vec3d tiltAxis = azDir.normalize();
             planeRight = rotateAroundAxis(right, tiltAxis, DIVERGE_TILT);
             planeUp    = rotateAroundAxis(ringUp, tiltAxis, DIVERGE_TILT);
         }
 
-        // The 6th circle (index 5) doesn't sit still at the aim point like the others — its
-        // whole formation orbits the aim point on its own, slower revolution while its arrows
-        // keep spinning around that moving local center; shrunk a little so it reads as a
-        // satellite circle in motion rather than just another static ring.
+        // The orbiting circle ignores the static azimuth shift above — its whole formation
+        // instead orbits the aim point continuously while its arrows keep spinning around that
+        // moving local center; shrunk a little so it reads as a satellite circle in motion.
         if (circle == ORBIT_CIRCLE_INDEX) {
             double orbitAngle = t * (ORBIT6_SPEED / ROTATION_SPEED);
             double cosO = Math.cos(orbitAngle) * ORBIT6_RADIUS, sinO = Math.sin(orbitAngle) * ORBIT6_RADIUS;

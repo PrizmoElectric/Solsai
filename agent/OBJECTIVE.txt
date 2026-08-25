@@ -1,0 +1,44 @@
+SOLSAI — CORE OBJECTIVE
+========================
+
+  THE SERVER-SIDE GROUND TRUTH
+
+Solsai is a Minecraft server-side mod (formerly "Zote Context Mod") that exposes the
+authoritative state of the world, bots, and player as a plain HTTP API on port 8080 — and,
+increasingly, lets the player DO things in that world (shields, clones, a gauntlet ally, arrow
+formations, passive enchants/effects, body scale) through the same API, driven by the
+prizmo-system client mod's UI.
+
+The end goal is a mod that:
+
+  • Is the one source of truth every other piece of this project reads from
+      Block/item registries, nearby-block context, inventories, entity state
+      NILO and ZOTE (mineflayer bots) never guess — they ask Solsai
+
+  • Lets the player manifest real, server-authoritative effects, not client illusions
+      Shields, clones, gauntlet, arrows all exist as real entities other players/mobs see
+      Every "spell" has a real cost (durability, hearts, hunger, inventory items)
+      Nothing here is client-side smoke and mirrors — if prizmo-system's client
+      disappeared tomorrow, `curl` could still drive every one of these features
+
+  • Stays purely server-sided
+      environment: "server" in fabric.mod.json — no matching client jar exists or should
+      Anything that would require a client-side asset/registry entry needs a different
+        approach (see the disabled ShieldBlock laser-blocker — CHECKLIST.txt)
+
+  • Keeps bots and player sharing the same world model
+      /bot-mode, /bot-control, /mirror-events — Nilo pushes and polls the same state
+        structures the player's HUD (prizmo-system) reads
+      Remote-control/possession is just another consumer of this state, not a special case
+
+  • Grows new "manifestation" features without becoming unmaintainable
+      Each spell system (Shield/Clone/Gauntlet/Arrow) is its own manager class with a
+        clear public API (manifest/dismiss/state) and a ServerTickEvents hook
+      ContextMod.java stays a thin HTTP-routing layer — parse query params, call the
+        manager, sendJson() the result. Real logic lives in the manager.
+
+─────────────────────────────────────────────────────────────
+Everything built should move toward a server that needs no client
+mod at all to be fully inspectable and controllable — prizmo-system
+is the nice way to use Solsai, not the only way.
+─────────────────────────────────────────────────────────────
