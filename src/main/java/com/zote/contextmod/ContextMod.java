@@ -110,6 +110,7 @@ public class ContextMod implements ModInitializer {
             CloneManager.onServerStart();
             GauntletManager.onServerStart();
             EnchantTracker.onServerStart();
+            SummonEnchantTracker.onServerStart();
             EffectTracker.onServerStart();
             ArrowManifestManager.onServerStart();
             startHttpServer();
@@ -126,6 +127,7 @@ public class ContextMod implements ModInitializer {
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server2) -> {
             var uuid = handler.player.getUuid();
             EnchantTracker.clearPlayer(uuid);
+            SummonEnchantTracker.clearPlayer(uuid);
             EffectTracker.disconnectPlayer(uuid);
             ArrowManifestManager.clearPlayer(uuid);
         });
@@ -577,6 +579,60 @@ public class ContextMod implements ModInitializer {
                 sendJson(exchange, "{\"ok\":true}");
             });
 
+            // GET /summon-enchant-toggle?player=X&type=arrow&id=namespace:name — toggle one
+            // enchant in a per-summon-type loadout (independent of /enchant-* above, which is
+            // one single global list). Returns {"active":bool,"id":"...","type":"..."}.
+            httpServer.createContext("/summon-enchant-toggle", exchange -> {
+                String player = "PrizmoElectric", type = null, id = null;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("type="))   type   = part.substring(5);
+                    else if (part.startsWith("id="))     id     = part.substring(3);
+                }
+                if (type == null || id == null) { sendJson(exchange, "{\"error\":\"missing type or id\"}"); return; }
+                Identifier enchId = Identifier.tryParse(id);
+                if (enchId == null) { sendJson(exchange, "{\"error\":\"invalid id\"}"); return; }
+                var spe = server.getPlayerManager().getPlayer(player);
+                if (spe == null) { sendJson(exchange, "{\"error\":\"player not found\"}"); return; }
+                boolean nowActive = SummonEnchantTracker.toggle(spe.getUuid(), type, enchId);
+                sendJson(exchange, "{\"active\":" + nowActive + ",\"id\":\"" + enchId + "\",\"type\":\"" + type + "\"}");
+            });
+
+            // GET /summon-enchant-list?player=X&type=arrow — returns {"active":["id1",...]}
+            httpServer.createContext("/summon-enchant-list", exchange -> {
+                String player = "PrizmoElectric", type = "arrow";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("type="))   type   = part.substring(5);
+                }
+                var spe = server.getPlayerManager().getPlayer(player);
+                var active = spe != null ? SummonEnchantTracker.getActiveSet(spe.getUuid(), type) : Set.of();
+                StringBuilder sb = new StringBuilder("{\"active\":[");
+                boolean first = true;
+                for (var eid : active) {
+                    if (!first) sb.append(',');
+                    sb.append('"').append(eid).append('"');
+                    first = false;
+                }
+                sb.append("]}");
+                sendJson(exchange, sb.toString());
+            });
+
+            // GET /summon-enchant-clear?player=X&type=arrow — remove one summon type's loadout
+            httpServer.createContext("/summon-enchant-clear", exchange -> {
+                String player = "PrizmoElectric", type = "arrow";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("type="))   type   = part.substring(5);
+                }
+                var spe = server.getPlayerManager().getPlayer(player);
+                if (spe != null) SummonEnchantTracker.clear(spe.getUuid(), type);
+                sendJson(exchange, "{\"ok\":true}");
+            });
+
             // GET /effect-toggle?player=X&id=namespace:name — toggle one passive status effect
             httpServer.createContext("/effect-toggle", exchange -> {
                 String player = "PrizmoElectric", id = null;
@@ -678,6 +734,185 @@ public class ContextMod implements ModInitializer {
                     } catch (NumberFormatException ignored) {}
                 }
                 sendJson(exchange, ArrowManifestManager.manifestBurst(server, player, count));
+            });
+
+            // GET /arrow-set-formation?player=X&formation=magecircle|barrage|circles&count=N
+            // Sets the player's current arrow formation. count (1-4) only applies to "circles".
+            httpServer.createContext("/arrow-set-formation", exchange -> {
+                String player = "PrizmoElectric", formation = "magecircle";
+                int count = 1;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))    player    = part.substring(7);
+                    else if (part.startsWith("formation=")) formation = part.substring(10);
+                    else if (part.startsWith("count="))     try {
+                        count = Integer.parseInt(part.substring(6));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ArrowManifestManager.setFormation(server, player,
+                    formation.equals("magecircle") ? "MAGE_CIRCLE" : formation, count));
+            });
+
+            // GET /arrow-set-firemode?player=X&mode=single|shotgun|burst|machinegun
+            httpServer.createContext("/arrow-set-firemode", exchange -> {
+                String player = "PrizmoElectric", mode = "shotgun";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("mode="))   mode   = part.substring(5);
+                }
+                sendJson(exchange, ArrowManifestManager.setFireMode(server, player,
+                    mode.equals("machinegun") ? "MACHINE_GUN" : mode));
+            });
+
+            // GET /arrow-set-circle-slot?player=X&index=0-3&slot=center|left|right|top_right|
+            // top_left|bottom_right|bottom_left — per-circle-index position override for
+            // CIRCLES formation (applies immediately if that circle is currently active).
+            httpServer.createContext("/arrow-set-circle-slot", exchange -> {
+                String player = "PrizmoElectric", slot = "center";
+                int index = 0;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("index="))  try {
+                        index = Integer.parseInt(part.substring(6));
+                    } catch (NumberFormatException ignored) {}
+                    else if (part.startsWith("slot="))   slot = part.substring(5);
+                }
+                sendJson(exchange, ArrowManifestManager.setCircleSlot(server, player, index, slot));
+            });
+
+            // GET /arrow-set-circles-sequential?player=X&enabled=true|false — CIRCLES: every
+            // group draining independently in parallel (default) vs one shared round-robin turn
+            // order, one shot per turn.
+            httpServer.createContext("/arrow-set-circles-sequential", exchange -> {
+                String player = "PrizmoElectric";
+                boolean enabled = false;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))  player  = part.substring(7);
+                    else if (part.startsWith("enabled=")) enabled = "true".equals(part.substring(8));
+                }
+                sendJson(exchange, ArrowManifestManager.setCirclesSequential(server, player, enabled));
+            });
+
+            // GET /arrow-set-barrage-spread?player=X&preset=close|normal|wide
+            httpServer.createContext("/arrow-set-barrage-spread", exchange -> {
+                String player = "PrizmoElectric", preset = "normal";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("preset=")) preset = part.substring(7);
+                }
+                sendJson(exchange, ArrowManifestManager.setBarrageSpread(server, player, preset));
+            });
+
+            // GET /arrow-set-rain-count?player=X&count=1-500 — Rain "power" knob, see RED
+            // TERMINAL's SKILLS tab. formation=rain + /arrow-shoot actually casts it.
+            httpServer.createContext("/arrow-set-rain-count", exchange -> {
+                String player = "PrizmoElectric";
+                int count = 100;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("count="))  try {
+                        count = Integer.parseInt(part.substring(6));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ArrowManifestManager.setRainCount(server, player, count));
+            });
+
+            // GET /arrow-set-rain-target?player=X&mode=self|aim
+            httpServer.createContext("/arrow-set-rain-target", exchange -> {
+                String player = "PrizmoElectric", mode = "self";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("mode="))   mode   = part.substring(5);
+                }
+                sendJson(exchange, ArrowManifestManager.setRainTarget(server, player, mode));
+            });
+
+            // GET /arrow-set-rain-lifedrain?player=X&enabled=true|false
+            httpServer.createContext("/arrow-set-rain-lifedrain", exchange -> {
+                String player = "PrizmoElectric";
+                boolean enabled = false;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))  player  = part.substring(7);
+                    else if (part.startsWith("enabled=")) enabled = "true".equals(part.substring(8));
+                }
+                sendJson(exchange, ArrowManifestManager.setRainLifeDrain(server, player, enabled));
+            });
+
+            // GET /skill-equip?player=X&skill=arrow_rain — which skill MasterWheelScreen's
+            // "Skill" wedge casts. Generic-shaped (a plain skill-name string) so a future
+            // second skill is a registry addition, not a rearchitecture.
+            httpServer.createContext("/skill-equip", exchange -> {
+                String player = "PrizmoElectric", skill = "arrow_rain";
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player=")) player = part.substring(7);
+                    else if (part.startsWith("skill="))  skill  = part.substring(6);
+                }
+                sendJson(exchange, ArrowManifestManager.setEquippedSkill(server, player, skill));
+            });
+
+            // GET /arrow-set-rune-spell?player=X&enabled=true|false — decorative ENCHANT
+            // particle ring around the "spell area." Off by default; independent of runeAura.
+            httpServer.createContext("/arrow-set-rune-spell", exchange -> {
+                String player = "PrizmoElectric";
+                boolean enabled = false;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))  player  = part.substring(7);
+                    else if (part.startsWith("enabled=")) enabled = "true".equals(part.substring(8));
+                }
+                sendJson(exchange, ArrowManifestManager.setRuneSpell(server, player, enabled));
+            });
+
+            // GET /arrow-set-rune-aura?player=X&enabled=true|false — decorative ENCHANT
+            // particle ring around the player's own body ("aureola"). Off by default.
+            httpServer.createContext("/arrow-set-rune-aura", exchange -> {
+                String player = "PrizmoElectric";
+                boolean enabled = false;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))  player  = part.substring(7);
+                    else if (part.startsWith("enabled=")) enabled = "true".equals(part.substring(8));
+                }
+                sendJson(exchange, ArrowManifestManager.setRuneAura(server, player, enabled));
+            });
+
+            // GET /arrow-set-fire-rate?player=X&multiplier=0.5-3.0 — speed regulator: how fast
+            // Machine Gun releases / Barrage-Circles auto-conjure. Scales the existing
+            // no-arrow hunger chance right along with it (bigger speed, bigger chance).
+            httpServer.createContext("/arrow-set-fire-rate", exchange -> {
+                String player = "PrizmoElectric";
+                double multiplier = 1.0;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))     player = part.substring(7);
+                    else if (part.startsWith("multiplier=")) try {
+                        multiplier = Double.parseDouble(part.substring(11));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ArrowManifestManager.setFireRate(server, player, multiplier));
+            });
+
+            // GET /arrow-set-flight-speed?player=X&multiplier=0.5-3.0 — speed regulator: how
+            // fast released arrows travel. Adds its own release-time hunger chance.
+            httpServer.createContext("/arrow-set-flight-speed", exchange -> {
+                String player = "PrizmoElectric";
+                double multiplier = 1.0;
+                String q = exchange.getRequestURI().getQuery();
+                if (q != null) for (String part : q.split("&")) {
+                    if      (part.startsWith("player="))     player = part.substring(7);
+                    else if (part.startsWith("multiplier=")) try {
+                        multiplier = Double.parseDouble(part.substring(11));
+                    } catch (NumberFormatException ignored) {}
+                }
+                sendJson(exchange, ArrowManifestManager.setFlightSpeed(server, player, multiplier));
             });
 
             // GET /arrow-shoot?player=X — launch all manifested arrows at the player's look direction

@@ -119,6 +119,12 @@ public class ShieldManifestManager {
         float lastHealth = -1f; // -1 = uninitialised; updated each tick for pool drain tracking
         // Per-shield durability pool: Integer.MAX_VALUE = legacy/split mode (no individual limit)
         int durabilityPool = Integer.MAX_VALUE;
+        // True when this shield was paid for with addExhaustion(3.0f) (no real shield in
+        // inventory at spawn time — see spawnShieldsAuto()'s fallback branch) rather than a
+        // real consumed item. Dismissing an unused one refunds exactly that exhaustion —
+        // see dismissAll()/dismissSome(). Never set for split/spawnShields()-sourced shields,
+        // which always consume a real item.
+        boolean hungerCost = false;
         ShieldInstance(UUID u) { this.standUUID = u; }
     }
 
@@ -398,8 +404,10 @@ public class ShieldManifestManager {
         for (int n = 0; n < count; n++) {
             ItemStack shieldStack = consumeShieldFromInventory(player);
             int pool;
+            boolean fromHunger = false;
             if (shieldStack == null) {
                 player.addExhaustion(3.0f);
+                fromHunger = true;
                 shieldStack = new ItemStack(Items.SHIELD);
                 pool = 100;
             } else {
@@ -410,6 +418,7 @@ public class ShieldManifestManager {
 
             ShieldInstance inst = new ShieldInstance(display.getUuid());
             inst.durabilityPool = pool;
+            inst.hungerCost = fromHunger;
             set.shields.add(inst);
         }
 
@@ -522,8 +531,21 @@ public class ShieldManifestManager {
             ServerPlayerEntity player = server.getPlayerManager().getPlayer(playerName);
             if (player == null) return;
             ShieldSet set = playerShields.remove(player.getUuid());
-            if (set != null) discardSet(player.getServerWorld(), set);
+            if (set != null) {
+                refundHungerCost(player, set.shields);
+                discardSet(player.getServerWorld(), set);
+            }
         });
+    }
+
+    /** Undoes the exact exhaustion charge (see spawnShieldsAuto()'s fallback branch) for
+     *  every hunger-funded instance being discarded — dismissing an unused shield gives back
+     *  what it cost. Shields backed by a real consumed inventory item never refund, same as
+     *  today (the real item isn't given back either). */
+    private static void refundHungerCost(ServerPlayerEntity player, List<ShieldInstance> shields) {
+        for (ShieldInstance inst : shields) {
+            if (inst.hungerCost) player.addExhaustion(-3.0f);
+        }
     }
 
     /** Removes up to `count` shields (most-recently-added first), leaving any rest active.
@@ -541,6 +563,7 @@ public class ShieldManifestManager {
             int toRemove = Math.min(count, set.shields.size());
             for (int i = 0; i < toRemove; i++) {
                 ShieldInstance inst = set.shields.remove(set.shields.size() - 1);
+                if (inst.hungerCost) player.addExhaustion(-3.0f);
                 Entity e = world.getEntity(inst.standUUID);
                 if (e != null) e.discard();
                 removeShieldBlock(world, inst);
@@ -672,6 +695,27 @@ public class ShieldManifestManager {
                     positionDistributed(world, set.shields, eye, fDir);
                 }
 
+            } else if (total == 1) {
+                // BUG FIX (user, live 2026-08-25): a single dome shield used to run through
+                // fibPoint(0, 1, ...), which places it at the equator and orbits it with
+                // globalAngle — independent of where the player is looking, since dome mode
+                // isn't aim-tracking at all for N>1 either (a full shell doesn't have a
+                // single "front"). With only one shield there IS an obvious "front" the
+                // player expects it to sit at, so this one case is special-cased to sit at
+                // the aim direction instead — same eye-origin convention FOCUS mode already
+                // uses ("crosshair ray originates at the eyes", see below).
+                ShieldInstance inst = set.shields.get(0);
+                Entity shield = world.getEntity(inst.standUUID);
+                if (shield != null) {
+                    Vec3d eye = player.getEyePos();
+                    Vec3d look = lookVector(player);
+                    double nx = eye.x + look.x * ORBIT_RADIUS;
+                    double ny = eye.y + look.y * ORBIT_RADIUS;
+                    double nz = eye.z + look.z * ORBIT_RADIUS;
+                    shield.setPosition(nx, ny, nz);
+                    faceOutward(shield, eye);
+                    updateShieldBlock(world, inst, nx, ny, nz);
+                }
             } else {
                 // Fibonacci dome with slow Y-rotation
                 for (int i = 0; i < total; i++) {

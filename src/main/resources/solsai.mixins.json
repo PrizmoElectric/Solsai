@@ -10,7 +10,8 @@
     "LivingEntityEnchantMixin",
     "EnchantmentHelperMixin",
     "DisplayEntityInvoker",
-    "ItemDisplayEntityInvoker"
+    "ItemDisplayEntityInvoker",
+    "RainArrowOwnerImmunityMixin"
   ],
   "injectors": {
     "defaultRequire": 1
